@@ -1,5 +1,8 @@
 use serde::{Deserialize, Serialize};
 
+// Special token marker byte (0xFF) - required prefix for llguidance special tokens
+const SPECIAL_MARKER: char = '\u{00FF}';
+
 const STARTING_CONVO_TEMPLATE: &str = r#"
 This is a simulated conversation between:
 
@@ -55,13 +58,13 @@ Dosage information for {brandname} is available on the back of the bottle.
 """
 "#;
 
-const STARTING_CONVO_GRAMMAR: &str = r#"start: initial_message hcp_response
-initial_message: <|start_header_id|> "VC" <|end_header_id|> /(.|\n)*/ <|eot_id|>
-hcp_response: <|start_header_id|> "VC" <|end_header_id|> hcp_content <|eot_id|>
+// Grammar template with placeholders for special tokens
+const STARTING_CONVO_GRAMMAR_TEMPLATE: &str = r#"start: hcp_response
+hcp_response: {START_HEADER} "HCP" {END_HEADER} hcp_content {EOT} vc_response
 hcp_content: /(.|\n){hcplimit}/
-vc_response: <|start_header_id|> "VC" <|end_header_id|> "Category: " category_responses <|eot_id|> (hcp_response)?
+vc_response: {START_HEADER} "VC" {END_HEADER} "Category: " category_responses {EOT} (hcp_response)?
 
-// categories get added
+// brand specific category information
 "#;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -71,33 +74,46 @@ pub struct VCmessage {
 }
 
 pub struct Conversation {
-    possible_vc_messages: Vec<VCmessage>,
-    brand_name: String,
-    system_prompt: String,
-    lark_grammar: String,
+    pub possible_vc_messages: Vec<VCmessage>,
+    pub brand_name: String,
+    pub system_prompt: String,
+    pub lark_grammar: String,
 }
 
 impl Conversation {
     pub fn new(brand_name: String, vc_messages: Vec<VCmessage>) -> Self {
         let system_prompt = STARTING_CONVO_TEMPLATE.replace("{brandname}", &brand_name);
-        let mut lark_grammar = STARTING_CONVO_GRAMMAR.to_string();
+
+        // Create properly marked special tokens for the grammar
+        let start_header = format!("\"{}{}\"", SPECIAL_MARKER, "<|start_header_id|>");
+        let end_header = format!("\"{}{}\"", SPECIAL_MARKER, "<|end_header_id|>");
+        let eot = format!("\"{}{}\"", SPECIAL_MARKER, "<|eot_id|>");
+
+        let mut lark_grammar = STARTING_CONVO_GRAMMAR_TEMPLATE
+            .replace("{hcplimit}", "{0,50}")
+            .replace("{START_HEADER}", &start_header)
+            .replace("{END_HEADER}", &end_header)
+            .replace("{EOT}", &eot);
+
         let category_response = vc_messages
             .iter()
             .map(|vc_m| {
                 format!(
-                    "\"{category}\n\" response_{category}",
+                    "\"{category}\\n\" response_{category}",
                     category = vc_m.category
                 )
             })
             .collect::<Vec<_>>()
             .join(" | ");
-        lark_grammar += &format!("category_responses: {category_response}");
+        lark_grammar += &format!("category_responses: {category_response}\n");
         let category_messages = vc_messages
             .iter()
             .map(|vc_m| format!("response_{}: \"{}\"", vc_m.category, vc_m.message))
             .collect::<Vec<_>>()
             .join("\n");
         lark_grammar += &category_messages;
+        dbg!(&lark_grammar);
+        println!("{}", &lark_grammar);
 
         // let category_responses = format!("category_responses: {}", );
         Self {
@@ -106,5 +122,22 @@ impl Conversation {
             system_prompt,
             lark_grammar,
         }
+    }
+
+    pub fn get_system_prompt(&self) -> String {
+        format!(
+            "{}{}{}{}{}{}{}",
+            SPECIAL_MARKER,
+            "<|start_header_id|>",
+            SPECIAL_MARKER,
+            "<|end_header_id|>",
+            self.system_prompt,
+            SPECIAL_MARKER,
+            "<|eot_id|>"
+        )
+    }
+
+    pub fn get_initial_message(&self) -> String {
+        "Hello! I am reaching out to you about XARELTO please feel free to ask any questions about drug samples, or dosing.".to_string()
     }
 }

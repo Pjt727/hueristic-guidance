@@ -25,11 +25,6 @@ use std::sync::Arc;
 
 use crate::conversation_grammar::{Conversation, VCmessage};
 
-const SIMPLE_LARK_GRAMMAR: &str = r#"start: "Roses are red,\nViolets are " COLOR "\nThe honey's " ADJECTIVE ", and so are you"
-ADJECTIVE: "sweet" | "bitter"
-COLOR: "blue" | "red"
-"#;
-
 fn to_llama_token(usize_token: u32) -> LlamaToken {
     LlamaToken(usize_token as i32)
 }
@@ -116,13 +111,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // setup the tokenizer
     println!("Creating tokenizer environment...");
+
+    // Helper function to find token ID by string
+    let find_token_id = |token_str: &str| -> Option<u32> {
+        for (token, _) in model.tokens(Special::Tokenize) {
+            if let Ok(bytes) = model.token_to_bytes(token, Special::Tokenize) {
+                if let Ok(s) = std::str::from_utf8(&bytes) {
+                    if s == token_str {
+                        return Some(token.0 as u32);
+                    }
+                }
+            }
+        }
+        None
+    };
+
+    // Find Llama 3 special tokens
+    let tok_start_header = find_token_id("<|start_header_id|>");
+    let tok_end_header = find_token_id("<|end_header_id|>");
+    let tok_eot = find_token_id("<|eot_id|>");
+
+    println!("Special tokens found:");
+    println!("  <|start_header_id|>: {:?}", tok_start_header);
+    println!("  <|end_header_id|>: {:?}", tok_end_header);
+    println!("  <|eot_id|>: {:?}", tok_eot);
+
     let token_info = TokRxInfo {
         vocab_size: model.tokens(Special::Tokenize).count() as u32,
         tok_eos: model.token_eos().0 as u32,
         tok_bos: Some(model.token_bos().0 as u32),
         tok_pad: None,
         tok_unk: None,
-        tok_end_of_turn: None,
+        tok_end_of_turn: tok_eot,
     };
     let all_words: Vec<Vec<u8>> = model
         .tokens(Special::Tokenize)
@@ -143,7 +163,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
         &SlicedBiasComputer::general_slices(),
     )?;
-    let grammar = TopLevelGrammar::from_lark(SIMPLE_LARK_GRAMMAR.to_string());
+    let conversation = get_default_conversation();
+    let grammar = TopLevelGrammar::from_lark(conversation.lark_grammar.to_string());
     let token_parser =
         parser_factory.create_parser_from_init_default(GrammarInit::Serialized(grammar))?;
 
@@ -151,15 +172,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut constraint = Constraint::new(token_parser);
 
     // starting input which needs to go into both the constraint as well as the llm
-    let starting_input = "Roses are red,\nViolets are ";
-    let token_ids = tok_env.tokenize(starting_input);
-    let token_ids_llama = model.str_to_token(starting_input, llama_cpp_2::model::AddBos::Never);
-    dbg!(&token_ids);
-    dbg!(&token_ids_llama);
+    // system prompot and initial VC message do not need to ginto the constraint
+
+    let parser_input = "";
+    let inital_prompt = format!(
+        "{}\n{}\n{}",
+        conversation.get_system_prompt(),
+        conversation.get_initial_message(),
+        parser_input
+    );
+    let parser_token_ids = tok_env.tokenize_special(parser_input);
+    dbg!(&parser_token_ids);
+    let llm_token_ids = tok_env.tokenize_special(&inital_prompt);
     // dbg!(tok_env.tokenize_is_canonical());
     // dbg!(tokens_to_string(model.clone(), &token_ids));
     constraint.start_without_prompt();
-    constraint.force_tokens(&token_ids)?;
+    constraint.force_tokens(&parser_token_ids)?;
     // why is the healed string "  roses are red violets are roses are red violets are"
     // dbg!(model.token_attr(LlamaToken(28705)));
     // dbg!(model.token_to_bytes(LlamaToken(28705), Special::Tokenize)?);
@@ -174,8 +202,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut batch = LlamaBatch::new(512, 1);
     let seq_id = 0;
 
-    for (i, &token_id) in token_ids.iter().enumerate() {
-        let is_last = i == token_ids.len() - 1;
+    for (i, &token_id) in llm_token_ids.iter().enumerate() {
+        let is_last = i == llm_token_ids.len() - 1;
         batch.add(to_llama_token(token_id), i as i32, &[seq_id], is_last)?;
     }
 
@@ -183,13 +211,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ctx.decode(&mut batch)?;
 
     println!("\nPrompt processed. Starting inference loop...");
-    println!("Input: {}", starting_input);
+    println!("Input: {}", parser_input);
     print!("Output: ");
 
     // Inference loop
-    let mut n_current = token_ids.len();
-    let max_tokens = 20;
-    let mut running_input = starting_input.to_string();
+    let mut n_current = parser_token_ids.len();
+    let max_tokens = 200;
+    let mut running_input = parser_input.to_string();
 
     for _ in 0..max_tokens {
         // Get logits for the last token
