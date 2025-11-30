@@ -1,5 +1,9 @@
-mod conversation_grammar;
+mod constraints;
+mod conversation_loop;
+mod grammar;
+mod inference;
 mod llama_tokenizer;
+mod token;
 
 use llama_cpp_2::context::params::LlamaContextParams;
 use llama_cpp_2::context::LlamaContext;
@@ -23,7 +27,7 @@ use std::num::NonZero;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::conversation_grammar::{Conversation, VCmessage};
+use crate::grammar::{GrammarFlow, VCmessage};
 
 fn to_llama_token(usize_token: u32) -> LlamaToken {
     LlamaToken(usize_token as i32)
@@ -39,24 +43,9 @@ fn tokens_to_string(model: Arc<LlamaModel>, tokens: &[u32]) -> String {
         })
         .fold("".to_string(), |s1, s2| s1 + &s2)
 }
-// HCP:
-// “Can you send me sample info?”
-// VC:
-// """
-// Category: samples
-// Samples for {brandname} are available at the closest store.
-// """
-//
-// HCP:
-// “What’s the dosage?”
-// VC:
-// """
-// Category: dosing
-// Dosage information for {brandname} is available on the back of the bottle.
-// """
 
-fn get_default_conversation() -> Conversation {
-    Conversation::new(
+fn get_default_conversation() -> GrammarFlow {
+    GrammarFlow::new(
         "XARELTO".to_string(),
         vec![
             VCmessage {
@@ -112,29 +101,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // setup the tokenizer
     println!("Creating tokenizer environment...");
 
-    // Helper function to find token ID by string
-    let find_token_id = |token_str: &str| -> Option<u32> {
-        for (token, _) in model.tokens(Special::Tokenize) {
-            if let Ok(bytes) = model.token_to_bytes(token, Special::Tokenize) {
-                if let Ok(s) = std::str::from_utf8(&bytes) {
-                    if s == token_str {
-                        return Some(token.0 as u32);
-                    }
-                }
-            }
-        }
-        None
-    };
-
-    // Find Llama 3 special tokens
-    let tok_start_header = find_token_id("<|start_header_id|>");
-    let tok_end_header = find_token_id("<|end_header_id|>");
-    let tok_eot = find_token_id("<|eot_id|>");
-
-    println!("Special tokens found:");
-    println!("  <|start_header_id|>: {:?}", tok_start_header);
-    println!("  <|end_header_id|>: {:?}", tok_end_header);
-    println!("  <|eot_id|>: {:?}", tok_eot);
+    let special_tokens = vec!["<|start_header_id|>", "<|end_header_id|>", "<|eot_id|>"];
 
     let token_info = TokRxInfo {
         vocab_size: model.tokens(Special::Tokenize).count() as u32,
@@ -142,11 +109,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         tok_bos: Some(model.token_bos().0 as u32),
         tok_pad: None,
         tok_unk: None,
-        tok_end_of_turn: tok_eot,
+        tok_end_of_turn: None, // maybe change back
     };
     let all_words: Vec<Vec<u8>> = model
         .tokens(Special::Tokenize)
-        .map(|(t, _)| model.token_to_bytes(t, Special::Tokenize).unwrap())
+        .map(|(t, t_str)| {
+            let mut bytes = model.token_to_bytes(t, Special::Tokenize).unwrap();
+
+            // https://github.com/guidance-ai/llguidance/blob/main/docs/special_tokens.md
+            if let Ok(string_rep) = t_str
+                && special_tokens.contains(&string_rep.as_str())
+            {
+                bytes.insert(0, TokTrie::SPECIAL_TOKEN_MARKER)
+            }
+            bytes
+        })
         .collect();
     let tok_trie = TokTrie::from(&token_info, &all_words);
     let tokenizer = LlamaTokenizerEnv::new(tok_trie, Arc::clone(&model))?;
@@ -215,7 +192,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     print!("Output: ");
 
     // Inference loop
-    let mut n_current = parser_token_ids.len();
+    let mut n_current = llm_token_ids.len();
     let max_tokens = 200;
     let mut running_input = parser_input.to_string();
 
@@ -225,7 +202,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Get mask for valid token
         let mask = constraint.compute_mask()?;
-        let sample_mask = mask.sample_mask.clone().unwrap();
+        let sample_mask = mask.sample_mask.unwrap();
 
         // get the logits from the next canidates
         let mut unmasked_logit_ids: Vec<_> = logits
