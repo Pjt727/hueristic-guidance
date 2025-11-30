@@ -18,17 +18,7 @@ pub struct ConversationData {
 
 impl ConversationData {
     pub fn simple_generation(&mut self, max_tokens: usize, top_candidate_count: usize) {
-        // see if the loop needs to generate any grammar first
         let initial_tokens = self.constraint.process_prompt(vec![]);
-        // self.constraint.force_tokens(&initial_tokens).unwrap();
-        // dbg!(initial_token);
-        // // let commit_result = self.constraint.commit_token(Some("")).unwrap();
-        // let commit_result = self.constraint.commit_token(None).unwrap();
-        // dbg!(&commit_result);
-        // for token in &initial_token {
-        //     self.constraint.force_tokens(Some(*token)).unwrap();
-        // }
-        // self.llm.feed_tokens(&commit_result.ff_tokens);
         self.llm.feed_tokens(&initial_tokens);
 
         let mut running_input = "".to_string();
@@ -75,10 +65,10 @@ impl ConversationData {
     fn print_canidates(&self, canidates: &Vec<Canidate>) {
         for (i, c) in canidates.iter().enumerate() {
             println!(
-                "{}. {} - {:.4}%",
+                "{}. {} - {:.4}",
                 i,
                 self.tokenizer.tokens_to_string(&[c.token_id]),
-                c.probability * 100.0
+                c.logit
             )
         }
     }

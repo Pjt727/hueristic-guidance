@@ -35,6 +35,7 @@ impl LlamaTokenizerEnv {
                     && SPECIAL_TOKENS.contains(&string_rep.as_str())
                 {
                     if string_rep == END_TOKEN {
+                        dbg!(string_rep);
                         tok_end_of_turn = Some(t.0 as TokenID)
                     }
                     bytes.insert(0, TokTrie::SPECIAL_TOKEN_MARKER)
@@ -49,7 +50,7 @@ impl LlamaTokenizerEnv {
             tok_bos: Some(model.token_bos().0 as u32),
             tok_pad: None,
             tok_unk: None,
-            tok_end_of_turn: None, // maybe I need find the token
+            tok_end_of_turn,
         };
         let tok_trie = TokTrie::from(&token_info, &all_words);
         Self { model, tok_trie }

@@ -41,10 +41,10 @@ fn get_file_hash(tokens: &[TokenID]) -> String {
 
 pub struct LlamaLlm {
     model: &'static Arc<LlamaModel>,
-    batch_size: u32,
     seq_id: i32,
     current_token_position: i32,
     ctx: LlamaContext<'static>,
+    batch: LlamaBatch<'static>,
 }
 
 impl LlamaLlm {
@@ -82,11 +82,12 @@ impl LlamaLlm {
             // llama cpp expects this in sequence
             current_token_position = initial_tokens.len() as i32;
         }
+        let batch = LlamaBatch::new(batch_size as usize, 1);
         let mut llm = Self {
             model: model_ref,
-            batch_size,
             current_token_position,
             seq_id,
+            batch,
             ctx,
         };
 
@@ -106,11 +107,11 @@ impl Llm for LlamaLlm {
         if tokens.is_empty() {
             return;
         }
+        self.batch.clear();
         let llama_tokens = to_llama_tokens(tokens);
-        let mut batch = LlamaBatch::new(self.batch_size as usize, 1);
 
         for prefix_token in &llama_tokens[..llama_tokens.len() - 1] {
-            batch
+            self.batch
                 .add(
                     *prefix_token,
                     self.current_token_position,
@@ -122,7 +123,7 @@ impl Llm for LlamaLlm {
         }
         // add the last token with fix one
         let last_token = llama_tokens.last().unwrap();
-        batch
+        self.batch
             .add(
                 *last_token,
                 self.current_token_position,
@@ -132,7 +133,7 @@ impl Llm for LlamaLlm {
             .unwrap();
         self.current_token_position += 1;
 
-        self.ctx.decode(&mut batch).unwrap();
+        self.ctx.decode(&mut self.batch).unwrap();
     }
 
     fn get_canidates(&mut self) -> Canidates {
