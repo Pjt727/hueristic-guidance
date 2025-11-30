@@ -8,7 +8,7 @@ use llguidance::{
     toktrie::{InferenceCapabilities, TokEnv, TokRxInfo, TokTrie, TokenId, TokenizerEnv},
     Constraint, ParserFactory,
 };
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use crate::{
     get_default_grammar_flow,
@@ -19,11 +19,13 @@ use crate::{
 pub struct LlamaTokenizerEnv {
     model: Arc<LlamaModel>,
     tok_trie: TokTrie,
+    special_tokens_to_string: HashMap<TokenID, String>,
 }
 
 impl LlamaTokenizerEnv {
     pub fn new(model: Arc<LlamaModel>) -> Self {
         let mut tok_end_of_turn = None;
+        let mut special_tokens_to_string = HashMap::new();
 
         let all_words: Vec<Vec<u8>> = model
             .tokens(Special::Tokenize)
@@ -31,14 +33,18 @@ impl LlamaTokenizerEnv {
                 let mut bytes = model.token_to_bytes(t, Special::Tokenize).unwrap();
 
                 // https://github.com/guidance-ai/llguidance/blob/main/docs/special_tokens.md
-                if let Ok(string_rep) = t_str
-                    && SPECIAL_TOKENS.contains(&string_rep.as_str())
-                {
-                    if string_rep == END_TOKEN {
-                        dbg!(string_rep);
-                        tok_end_of_turn = Some(t.0 as TokenID)
+                // need to add 0xff prefix to words in the tree
+                if let Ok(string_rep) = t_str {
+                    let maybe_token = SPECIAL_TOKENS
+                        .iter()
+                        .find(|t| t.to_string() == string_rep.to_string());
+                    if let Some(special_token) = maybe_token {
+                        if string_rep == END_TOKEN {
+                            tok_end_of_turn = Some(t.0 as TokenID)
+                        }
+                        special_tokens_to_string.insert(t.0 as u32, special_token.to_string());
+                        bytes.insert(0, TokTrie::SPECIAL_TOKEN_MARKER)
                     }
-                    bytes.insert(0, TokTrie::SPECIAL_TOKEN_MARKER)
                 }
                 bytes
             })
@@ -50,22 +56,28 @@ impl LlamaTokenizerEnv {
             tok_bos: Some(model.token_bos().0 as u32),
             tok_pad: None,
             tok_unk: None,
-            tok_end_of_turn,
+            tok_end_of_turn: None,
         };
         let tok_trie = TokTrie::from(&token_info, &all_words);
-        Self { model, tok_trie }
+        Self {
+            model,
+            tok_trie,
+            special_tokens_to_string,
+        }
     }
 
     pub fn tokens_to_string(&self, tokens: &[TokenID]) -> String {
-        self.model
-            .tokens_to_str(
-                &tokens
-                    .iter()
-                    .map(|t| LlamaToken::new(*t as i32))
-                    .collect::<Vec<_>>(),
-                Special::Tokenize,
-            )
-            .unwrap()
+        let res = self.model.tokens_to_str(
+            &tokens
+                .iter()
+                .map(|t| LlamaToken::new(*t as i32))
+                .collect::<Vec<_>>(),
+            Special::Tokenize,
+        );
+        match res {
+            Ok(s) => s,
+            Err(_) => "Invalid utf-8".to_string(),
+        }
     }
 }
 
