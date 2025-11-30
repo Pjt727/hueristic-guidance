@@ -39,17 +39,17 @@ fn get_file_hash(tokens: &[TokenID]) -> String {
     format!("{:x}", hash)
 }
 
-struct LlamaLlm {
+pub struct LlamaLlm {
     model: &'static Arc<LlamaModel>,
     batch_size: u32,
     seq_id: i32,
-    current_token_positioin: i32,
+    current_token_position: i32,
     ctx: LlamaContext<'static>,
 }
 
 impl LlamaLlm {
-    /// if the initial toekns have been saved it will try to load from there
-    fn new(backend: &LlamaBackend, model: Arc<LlamaModel>, initial_tokens: &[TokenID]) -> Self {
+    /// if the initial tokens has been saved it will try to load from there
+    pub fn new(backend: &LlamaBackend, model: Arc<LlamaModel>, initial_tokens: &[TokenID]) -> Self {
         let batch_size = 512_u32;
         let context_size = 2048;
         let seq_id = 0;
@@ -68,25 +68,34 @@ impl LlamaLlm {
         possible_context_cache.push(get_file_hash(initial_tokens));
         let load_from_cache = possible_context_cache.exists();
         let llama_tokens = to_llama_tokens(initial_tokens);
+        // loading from the cache only sets the KV cache, which means we still need to feed the
+        // tokens
+        let mut current_token_position = 0;
         if load_from_cache {
             let cached_tokens = ctx
-                .load_session_file(possible_context_cache, context_size as usize)
+                .load_session_file(&possible_context_cache, context_size as usize)
                 .unwrap();
             assert_eq!(
                 cached_tokens, llama_tokens,
                 "llama ctx was not saved correctly"
             );
+            // llama cpp expects this in sequence
+            current_token_position = initial_tokens.len() as i32;
         }
-        // add direct
         let mut llm = Self {
             model: model_ref,
             batch_size,
-            current_token_positioin: 0,
+            current_token_position,
             seq_id,
             ctx,
         };
 
-        llm.feed_tokens(initial_tokens);
+        if !load_from_cache {
+            llm.feed_tokens(initial_tokens);
+            llm.ctx
+                .save_session_file(&possible_context_cache, &llama_tokens)
+                .unwrap();
+        }
 
         llm
     }
@@ -104,24 +113,24 @@ impl Llm for LlamaLlm {
             batch
                 .add(
                     *prefix_token,
-                    self.current_token_positioin,
+                    self.current_token_position,
                     &[self.seq_id],
                     false,
                 )
                 .unwrap();
-            self.current_token_positioin += 1;
+            self.current_token_position += 1;
         }
         // add the last token with fix one
         let last_token = llama_tokens.last().unwrap();
         batch
             .add(
                 *last_token,
-                self.current_token_positioin,
+                self.current_token_position,
                 &[self.seq_id],
                 true,
             )
             .unwrap();
-        self.current_token_positioin += 1;
+        self.current_token_position += 1;
 
         self.ctx.decode(&mut batch).unwrap();
     }
@@ -133,6 +142,7 @@ impl Llm for LlamaLlm {
             .map(|c| Canidate {
                 token_id: c.id().0 as TokenID,
                 probability: c.p(),
+                logit: c.logit(),
             })
             .collect();
         Canidates::new(canidates)

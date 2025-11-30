@@ -7,9 +7,9 @@ use llguidance::{
 
 use crate::grammar::GrammarFlow;
 
-pub fn new_default_constraint(conversation: &GrammarFlow, tok_env: &TokEnv) -> Constraint {
+pub fn new_default_constraint(grammar_flow: &GrammarFlow, tok_env: &TokEnv) -> Constraint {
     let parser_factory = ParserFactory::new(
-        &tok_env,
+        tok_env,
         InferenceCapabilities {
             ff_tokens: true,
             conditional_ff_tokens: true,
@@ -19,7 +19,7 @@ pub fn new_default_constraint(conversation: &GrammarFlow, tok_env: &TokEnv) -> C
         &SlicedBiasComputer::general_slices(),
     )
     .unwrap();
-    let grammar = TopLevelGrammar::from_lark(conversation.lark_grammar.to_string());
+    let grammar = TopLevelGrammar::from_lark(grammar_flow.lark_grammar.to_string());
     let token_parser = parser_factory
         .create_parser_from_init_default(GrammarInit::Serialized(grammar))
         .unwrap();

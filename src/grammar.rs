@@ -122,6 +122,7 @@ impl GrammarFlow {
     }
 
     pub fn get_initial_message(&self) -> String {
+        todo!();
         "Hello! I am reaching out to you about XARELTO please feel free to ask any questions about drug samples, or dosing.".to_string()
     }
 }

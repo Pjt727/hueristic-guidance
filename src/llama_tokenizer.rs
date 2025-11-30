@@ -11,7 +11,7 @@ use llguidance::{
 use std::sync::Arc;
 
 use crate::{
-    get_default_conversation,
+    get_default_grammar_flow,
     grammar::{END_TOKEN, SPECIAL_TOKENS},
     token::TokenID,
 };
