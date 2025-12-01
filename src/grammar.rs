@@ -1,47 +1,30 @@
 use serde::{Deserialize, Serialize};
 
-pub const ID_START_TOKEN: &str = "<|start_header_id|>";
-pub const ID_END_TOKEN: &str = "<|end_header_id|>";
-pub const END_TOKEN: &str = "<|eot_id|>";
-pub const SPECIAL_TOKENS: [&str; 3] = [ID_START_TOKEN, ID_END_TOKEN, END_TOKEN];
+// lama 3
+// pub const ID_START_TOKEN: &str = "<|start_header_id|>";
+// pub const ID_END_TOKEN: &str = "<|end_header_id|>";
+// pub const END_TURN_TOKEN_TOKEN: &str = "<|eot_id|>";
+
+// lama 4
+pub const ID_START_TOKEN: &str = "<|header_start|>";
+pub const ID_END_TOKEN: &str = "<|header_end|>";
+pub const END_TURN_TOKEN_TOKEN: &str = "<|eot|>";
+pub const SPECIAL_TOKENS: [&str; 3] = [ID_START_TOKEN, ID_END_TOKEN, END_TURN_TOKEN_TOKEN];
 
 const STARTING_CONVO_TEMPLATE: &str = r#"
-This is a simulated conversation between:
-
-* **HCP** — a healthcare provider who speaks freely.
-* **VC** — the Virtual Coordinator, a chatbot that responds **only with predefined, approved messages**.
-  The VC never improvises, never invents new content, and never produces text outside the approved list.
+You are a virtual Coordinator chatbot providing information about {brandname}.
+You interact with healthcare providers (HCP's) who ask questions about the brand.
+You must always respond with text directly from the approved list
 
 ---
 
-### **HCP Special Token Rules**
+## **Response rules**
 
-When speaking as **HCP**, you MUST:
-
-1. Produce the header:
-   <|start_header_id|>HCP<|end_header_id|>
-
-2. Ask your question in free natural language.
-
-3. **End the HCP message with the exact token <|eot_id|>**, with no text or whitespace after it.
-
-Example:
-
-<|start_header_id|>HCP<|end_header_id|>Where can I get samples?<|eot_id|>
-
----
-
-### **VC Behavior Rules:**
-
-1. The HCP asks questions in free natural language.
-2. The VC must **choose the correct category** from the approved list.
-3. Before the message text, the VC must output:
+1. Respond with the most appropiate response from the **Approved VC Responses**
+2. You must **choose the correct category** from the approved list.
+3. Before the message text, you must output:
 
    Category: <chosen_category>
-
-4. After the category line, the VC outputs the **exact approved message** from that category.
-5. The VC must never invent new categories or new text.
-6. The VC must end its message with the exact token <|eot_id|>.
 
 ---
 
@@ -55,34 +38,33 @@ Category: dosing
 
 ---
 
-### **VC Output Format (Important)**
+### **Example Conversation**
 
-A VC response **must always** follow this structure:
+HCP:
+```
+Can you send me sample info?
+```
 
-<|start_header_id|>VC<|end_header_id|>
-Category: <category>
-<approved message>
-<|eot_id|>
+VC:
+```
+Samples for {brandname} are available at the closest store.
+```
 
-Do not output explanations. Do not reference the rules.  
-Only output the category line, the approved message, and <|eot_id|>.
+HCP:
+```
+dosage please
+```
 
----
-
-### **Example of Expected Behavior**
-
-<|start_header_id|>HCP<|end_header_id|>Can you send me sample info?<|eot_id|>
-<|start_header_id|>VC<|end_header_id|>Category: samples
-Samples for {brandname} are available at the closest store.<|eot_id|>
-<|start_header_id|>HCP<|end_header_id|>What’s the dosage?<|eot_id|>
-<|start_header_id|>VC<|end_header_id|>Category: dosing
-Dosage information for {brandname} is available on the back of the bottle.<|eot_id|>
+VC:
+```
+Dosage information for {brandname} is available on the back of the bottle.
+```
 "#;
 
 const STARTING_CONVO_GRAMMAR_TEMPLATE: &str = r#"start: hcp_response
-hcp_response: <|start_header_id|> "HCP" <|end_header_id|> hcp_content <|eot_id|> vc_response
-hcp_content: /(.|\n){hcplimit}/
-vc_response: <|start_header_id|> "VC" <|end_header_id|> "Category: " category_responses <|eot_id|> (hcp_response)?
+hcp_response: {startheader} "user" {endheader} hcp_content{hcplimit} {endturn} vc_response
+hcp_content: <[0-128002]>
+vc_response: {startheader} "assistant" {endheader} "Category: " category_responses {endturn} hcp_response
 
 // brand specific category information
 "#;
@@ -104,12 +86,15 @@ impl GrammarFlow {
     pub fn new(brand_name: String, vc_messages: Vec<VCmessage>) -> Self {
         let system_prompt = STARTING_CONVO_TEMPLATE.replace("{brandname}", &brand_name);
         let mut lark_grammar = STARTING_CONVO_GRAMMAR_TEMPLATE.replace("{hcplimit}", "{0,50}");
+        lark_grammar = lark_grammar.replace("{startheader}", ID_START_TOKEN);
+        lark_grammar = lark_grammar.replace("{endheader}", ID_END_TOKEN);
+        lark_grammar = lark_grammar.replace("{endturn}", END_TURN_TOKEN_TOKEN);
         let category_response = vc_messages
             .iter()
             .map(|vc_m| {
                 format!(
                     "\"{category}\\n\" response_{category}",
-                    category = vc_m.category
+                    category = vc_m.category,
                 )
             })
             .collect::<Vec<_>>()

@@ -5,25 +5,10 @@ mod inference;
 mod llama_tokenizer;
 mod token;
 
-use llama_cpp_2::context::params::LlamaContextParams;
-use llama_cpp_2::context::LlamaContext;
 use llama_cpp_2::llama_backend::LlamaBackend;
-use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
-use llama_cpp_2::model::{LlamaModel, Special};
-use llama_cpp_2::token::LlamaToken;
-use llama_tokenizer::LlamaTokenizerEnv;
-use llguidance::api::{GrammarInit, TopLevelGrammar};
-use llguidance::earley::SlicedBiasComputer;
-use llguidance::ffi::{
-    llg_new_constraint_lark, llg_new_tokenizer, LlgConstraintInit, LlgTokenizer,
-};
-use llguidance::toktrie::{
-    ApproximateTokEnv, InferenceCapabilities, SimpleVob, TokEnv, TokRxInfo, TokTrie, TokenizerEnv,
-};
-use llguidance::{Constraint, ParserFactory};
-use std::io;
-use std::num::NonZero;
+use llama_cpp_2::model::LlamaModel;
+use llguidance::toktrie::TokenizerEnv;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -50,7 +35,7 @@ fn get_default_grammar_flow() -> GrammarFlow {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Initializing llama.cpp backend...");
     let backend = LlamaBackend::init()?;
-    let model_path = PathBuf::from("models/Meta-Llama-3-8B.Q5_K_M.gguf");
+    let model_path = PathBuf::from("models/Llama-4-Scout-17B-16E-Instruct-UD-IQ1_M.gguf");
     println!("Loading model from {:?}...", model_path);
 
     let model_params = LlamaModelParams::default();
@@ -75,7 +60,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         constraint,
     };
 
-    conversation_data.simple_generation(200, 5);
+    conversation_data.simple_hitl_generation(200, 10);
 
     Ok(())
 }

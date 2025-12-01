@@ -1,5 +1,4 @@
-use llama_cpp_2::token::LlamaToken;
-use llguidance::{toktrie::SimpleVob, Constraint};
+use llguidance::toktrie::SimpleVob;
 
 pub type TokenID = u32;
 
@@ -16,7 +15,7 @@ pub struct Canidates {
 
 impl Canidates {
     pub fn new(mut canidates: Vec<Canidate>) -> Self {
-        canidates.sort_by(|c1, c2| c2.probability.total_cmp(&c1.probability));
+        canidates.sort_by(|c1, c2| c2.logit.total_cmp(&c1.logit));
         Self { canidates }
     }
 
@@ -24,23 +23,14 @@ impl Canidates {
         let new_canidates: Vec<_> = self
             .canidates
             .iter()
-            .filter(|c| mask.is_allowed(c.token_id))
+            .filter(|&c| mask.is_allowed(c.token_id))
+            .cloned()
             .collect();
 
-        // normalize the probability distribution
-        let total: f32 = new_canidates.iter().map(|c| c.probability).sum();
-        for c in &mut self.canidates {
-            c.probability /= total;
-        }
+        self.canidates = new_canidates;
     }
 
-    pub fn top_n(&self, n: usize) -> Vec<Canidate> {
-        self.canidates.iter().take(n).cloned().collect()
-    }
-
-    pub fn top_n_by_logits(&mut self, n: usize) -> Vec<Canidate> {
-        self.canidates
-            .sort_by(|c1, c2| c2.logit.total_cmp(&c1.logit));
+    pub fn top_n(&mut self, n: usize) -> Vec<Canidate> {
         self.canidates.iter().take(n).cloned().collect()
     }
 }

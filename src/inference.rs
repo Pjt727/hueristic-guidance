@@ -5,13 +5,9 @@ use llama_cpp_2::{
     llama_backend::LlamaBackend,
     llama_batch::LlamaBatch,
     model::LlamaModel,
-    token::{data::LlamaTokenData, LlamaToken},
+    token::LlamaToken,
 };
-use std::{
-    num::NonZero,
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use std::{num::NonZero, path::PathBuf, sync::Arc};
 
 use crate::token::Canidate;
 
@@ -72,6 +68,7 @@ impl LlamaLlm {
         // tokens
         let mut current_token_position = 0;
         if load_from_cache {
+            println!("Getting model ctx cache: {:?}", possible_context_cache);
             let cached_tokens = ctx
                 .load_session_file(&possible_context_cache, context_size as usize)
                 .unwrap();
