@@ -35,6 +35,7 @@ fn get_default_grammar_flow() -> GrammarFlow {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Initializing llama.cpp backend...");
     let backend = LlamaBackend::init()?;
+    // let model_path = PathBuf::from("models/Meta-Llama-3-8B.Q5_K_M.gguf");
     let model_path = PathBuf::from("models/Llama-4-Scout-17B-16E-Instruct-UD-IQ1_M.gguf");
     println!("Loading model from {:?}...", model_path);
 

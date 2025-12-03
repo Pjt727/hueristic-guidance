@@ -4,10 +4,10 @@ use std::sync::Arc;
 use llguidance::toktrie::TokenizerEnv;
 use llguidance::Constraint;
 
-use crate::grammar::{GrammarFlow, END_TURN_TOKEN_TOKEN};
+use crate::grammar::GrammarFlow;
 
 use crate::inference::Llm;
-use crate::llama_tokenizer::LlamaTokenizerEnv;
+use crate::llama_tokenizer::{LlamaTokenizerEnv, END_TURN_TOKEN, ID_END_TOKEN, ID_START_TOKEN};
 use crate::token::Canidate;
 
 pub struct ConversationData {
@@ -24,55 +24,42 @@ impl ConversationData {
 
         let mut running_input = self.tokenizer.tokens_to_string(&initial_tokens);
 
-        let mut is_human_turn = true;
-
         // dbg!(self.constraint.parser.dump_state());
         // self.constraint
         //     .commit_token(Some(self.tokenizer.tokenize(END_TURN_TOKEN_TOKEN)[0]))
         //     .unwrap();
         // dbg!(self.constraint.parser.dump_state());
 
-        println!("Conversation: ```{running_input}```");
+        // get an initial user prompt
+        let mut input = String::new();
+        io::stdin()
+            .read_line(&mut input)
+            .expect("Failed to read line");
+        input = input.strip_suffix("\n").unwrap().to_string();
+        let initial_prompt = format!("{ID_START_TOKEN}user{ID_END_TOKEN}{input}{END_TURN_TOKEN}{ID_START_TOKEN}assistant{ID_END_TOKEN}{running_input}");
+        let initial_tokens = self.tokenizer.tokenize(&initial_prompt);
+        self.llm.feed_tokens(&initial_tokens);
+
+        println!("Conversation: ```{initial_prompt}```");
 
         for _ in 0..max_tokens {
-            let last_token;
-            if is_human_turn {
-                // the conversation state should be "...<|start_header_id|>user<|end_header_id|>";
-                is_human_turn = false;
-                let mut input = String::new();
-                io::stdin()
-                    .read_line(&mut input)
-                    .expect("Failed to read line");
-                input = input.strip_suffix("\n").unwrap().to_string();
+            // the conversation state should be
+            // "...<|start_header_id|>assistant<|end_header_id|>...";
+            // getting the top candiates from llm inferance
+            let mut canidates = self.llm.get_canidates();
+            let premask_top = canidates.top_n(top_candidate_count);
+            let mask = self.constraint.compute_mask().unwrap();
+            let sample_mask = mask.sample_mask.clone().unwrap();
+            canidates.constrain(&sample_mask);
+            let mask_top = canidates.top_n(top_candidate_count);
+            println!("\n\nTop {top_candidate_count} unmasked tokens:");
+            self.print_canidates(&premask_top);
+            println!("\n\nTop {top_candidate_count} masked tokens:");
+            self.print_canidates(&mask_top);
 
-                // add the the human tokens to the constraint and the llm
-                let human_input_tokens = self.tokenizer.tokenize(&input);
-                running_input += &input;
-                self.constraint.force_tokens(&human_input_tokens).unwrap();
-                self.llm.feed_tokens(&human_input_tokens);
+            // choose the top masked
+            let last_token = mask_top.first().unwrap().token_id;
 
-                // we have to add the end token
-                let _mask = self.constraint.compute_mask(); // we have to computer the mask or it
-                                                            // wont' add the token
-                last_token = self.tokenizer.tokenize(END_TURN_TOKEN_TOKEN)[0];
-            } else {
-                is_human_turn = true;
-                // the conversation state should be "...<|start_header_id|>assistant<|end_header_id|>";
-                // getting the top candiates from llm inferance
-                let mut canidates = self.llm.get_canidates();
-                let premask_top = canidates.top_n(top_candidate_count);
-                let mask = self.constraint.compute_mask().unwrap();
-                let sample_mask = mask.sample_mask.clone().unwrap();
-                canidates.constrain(&sample_mask);
-                let mask_top = canidates.top_n(top_candidate_count);
-                println!("\n\nTop {top_candidate_count} unmasked tokens:");
-                self.print_canidates(&premask_top);
-                println!("\n\nTop {top_candidate_count} masked tokens:");
-                self.print_canidates(&mask_top);
-
-                // choose the top masked
-                last_token = mask_top.first().unwrap().token_id;
-            }
             // dbg!(self.constraint.parser.dump_state());
             let last_commit_result = self.constraint.commit_token(Some(last_token)).unwrap();
             let ff_tokens = last_commit_result.ff_tokens;

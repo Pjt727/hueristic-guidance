@@ -5,10 +5,19 @@ use llama_cpp_2::{
 use llguidance::toktrie::{TokRxInfo, TokTrie, TokenId, TokenizerEnv};
 use std::{collections::HashMap, sync::Arc};
 
-use crate::{
-    grammar::{END_TURN_TOKEN_TOKEN, SPECIAL_TOKENS},
-    token::TokenID,
-};
+use crate::token::TokenID;
+
+// 4
+pub const ID_START_TOKEN: &str = "<|header_start|>";
+pub const ID_END_TOKEN: &str = "<|header_end|>";
+pub const END_TURN_TOKEN: &str = "<|eot|>";
+
+// lama 3
+// pub const ID_START_TOKEN: &str = "<|start_header_id|>";
+// pub const ID_END_TOKEN: &str = "<|end_header_id|>";
+// pub const END_TURN_TOKEN: &str = "<|eot_id|>";
+
+pub const SPECIAL_TOKENS: [&str; 3] = [ID_START_TOKEN, ID_END_TOKEN, END_TURN_TOKEN];
 
 pub struct LlamaTokenizerEnv {
     model: Arc<LlamaModel>,
@@ -17,12 +26,8 @@ pub struct LlamaTokenizerEnv {
 
 impl LlamaTokenizerEnv {
     pub fn new(model: Arc<LlamaModel>) -> Self {
-        let tok_end_of_turn = Some(
-            model
-                .str_to_token(END_TURN_TOKEN_TOKEN, AddBos::Never)
-                .unwrap()[0]
-                .0 as u32,
-        );
+        let tok_end_of_turn =
+            Some(model.str_to_token(END_TURN_TOKEN, AddBos::Never).unwrap()[0].0 as u32);
         // dbg!(END_TURN_TOKEN_TOKEN);
 
         // for some reason some of the to_string don't work so this might be more reliable
@@ -30,8 +35,8 @@ impl LlamaTokenizerEnv {
             .iter()
             .map(|t_str| model.str_to_token(t_str, AddBos::Never).unwrap()[0])
             .collect();
-        println!("{:?}", SPECIAL_TOKENS);
-        println!("{:?}", must_have_special_token_ids);
+        // println!("{:?}", SPECIAL_TOKENS);
+        // println!("{:?}", must_have_special_token_ids);
 
         // not sure llama 4 started having this problem
         let all_words: Vec<Vec<u8>> = model
@@ -40,23 +45,23 @@ impl LlamaTokenizerEnv {
                 // debug the tokens
                 // 200008
                 let mut bytes = model.token_to_bytes(t, Special::Tokenize).unwrap();
-                if t.0 == 200008 {
-                    println!("Token ID {t} debug information:");
-                    println!("Bytes {:?}", bytes);
-                    println!("Tokenize {:?}", model.token_to_str(t, Special::Tokenize));
-                    println!("PlainText {:?}", model.token_to_str(t, Special::Plaintext));
-                    println!(
-                        "Reverse {:?}",
-                        model.str_to_token(END_TURN_TOKEN_TOKEN, AddBos::Never)
-                    );
-                }
-                println!(
-                    "Token ID {}: {}",
-                    t.0,
-                    t_str
-                        .clone()
-                        .unwrap_or_else(|_| "Invalid string".to_string())
-                );
+                // if t.0 == 200008 {
+                //     println!("Token ID {t} debug information:");
+                //     println!("Bytes {:?}", bytes);
+                //     println!("Tokenize {:?}", model.token_to_str(t, Special::Tokenize));
+                //     println!("PlainText {:?}", model.token_to_str(t, Special::Plaintext));
+                //     println!(
+                //         "Reverse {:?}",
+                //         model.str_to_token(END_TURN_TOKEN, AddBos::Never)
+                //     );
+                // }
+                // println!(
+                //     "Token ID {}: {}",
+                //     t.0,
+                //     t_str
+                //         .clone()
+                //         .unwrap_or_else(|_| "Invalid string".to_string())
+                // );
                 // https://github.com/guidance-ai/llguidance/blob/main/docs/special_tokens.md
                 // need to add 0xff prefix to words in the tree
                 if must_have_special_token_ids.contains(&t) {
