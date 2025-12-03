@@ -14,11 +14,5 @@ Each time we need the LLM's inference for the next token that is a *critical poi
 Use heuristic data to massage logits at critical points to what gets the best results for the validation set.
 
 # algorithm
-```
-let C be a critical point
-
-let Cₜ be the be all valid next tokens
-
-let Cₜₑ⁺ be positive examples for a given categor
-let Cₜₑ⁻ be negative examples for a given token
-```
+VC for one critical point
+![algorithm](assets/algo.png)
