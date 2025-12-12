@@ -8,14 +8,14 @@ use std::{collections::HashMap, sync::Arc};
 use crate::token::TokenID;
 
 // 4
-pub const ID_START_TOKEN: &str = "<|header_start|>";
-pub const ID_END_TOKEN: &str = "<|header_end|>";
-pub const END_TURN_TOKEN: &str = "<|eot|>";
+// pub const ID_START_TOKEN: &str = "<|header_start|>";
+// pub const ID_END_TOKEN: &str = "<|header_end|>";
+// pub const END_TURN_TOKEN: &str = "<|eot|>";
 
 // lama 3
-// pub const ID_START_TOKEN: &str = "<|start_header_id|>";
-// pub const ID_END_TOKEN: &str = "<|end_header_id|>";
-// pub const END_TURN_TOKEN: &str = "<|eot_id|>";
+pub const ID_START_TOKEN: &str = "<|start_header_id|>";
+pub const ID_END_TOKEN: &str = "<|end_header_id|>";
+pub const END_TURN_TOKEN: &str = "<|eot_id|>";
 
 pub const SPECIAL_TOKENS: [&str; 3] = [ID_START_TOKEN, ID_END_TOKEN, END_TURN_TOKEN];
 

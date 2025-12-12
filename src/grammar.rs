@@ -24,14 +24,14 @@ You must always respond with text directly from the approved list.
 Category: samples
 Samples for {brandname} are available at the closest store.
 
-Category: dosage
+Category: dosing
 Dosage information for {brandname} is available on the back of the bottle.
 
 ---
 
 ### **Example Conversation**
 
-The healhcare providers says:
+The healthcare providers says:
 
 Can you send me sample info?
 
@@ -41,18 +41,18 @@ Category: samples
 Samples for {brandname} are available at the closest store.
 
 
-The healhcare providers says:
+The healthcare providers says:
 
 dosage please
 
 The virtual coordinator responds:
 
-Category: dosage
+Category: dosing
 Dosage information for {brandname} is available on the back of the bottle.
 "#;
 
 const STARTING_CONVO_GRAMMAR_TEMPLATE: &str = r#"
-start: "Category " reponse_option "\n"
+start: "Category: " reponse_option "\n"
 // brand specific category information
 "#;
 
