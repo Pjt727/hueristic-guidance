@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.100"
+csv = "1.3"
 llama-cpp-2 = "0.1.128"
 llguidance = "1.4.0"
 serde = { version = "1.0.228", features = ["derive"] }

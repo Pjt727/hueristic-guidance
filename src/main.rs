@@ -1,5 +1,6 @@
 mod constraints;
 mod conversation_loop;
+mod csv_loader;
 mod grammar;
 mod inference;
 mod llama_tokenizer;
@@ -13,23 +14,15 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::conversation_loop::{ConversationData, ConversationInfo};
-use crate::grammar::{GrammarFlow, VCmessage};
+use crate::grammar::GrammarFlow;
 
-fn get_default_grammar_flow() -> GrammarFlow {
-    GrammarFlow::new(
-        "XARELTO".to_string(),
-        vec![
-            VCmessage {
-                category: "samples".to_string(),
-                message: "Samples for XARELTO are available at the closest store.".to_string(),
-            },
-            VCmessage {
-                category: "dosing".to_string(),
-                message: "Dosage information for XARELTO is available on the back of the bottle."
-                    .to_string(),
-            },
-        ],
-    )
+fn get_pemazyre_grammar_flow() -> Result<GrammarFlow, Box<dyn std::error::Error>> {
+    let csv_path = "data/pemazyre.csv";
+    let vc_messages = csv_loader::load_pemazyre_responses(csv_path)?;
+
+    println!("Loaded {} Pemazyre response messages from CSV", vc_messages.len());
+
+    Ok(GrammarFlow::new("PEMAZYRE".to_string(), vc_messages))
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -45,7 +38,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let tokenizer = llama_tokenizer::LlamaTokenizerEnv::new(model.clone());
     let tokenizer = Arc::new(tokenizer);
-    let grammar_flow = get_default_grammar_flow();
+    let grammar_flow = get_pemazyre_grammar_flow()?;
     let system_message = grammar_flow.get_system_prompt();
     let initial_tokens = tokenizer.tokenize(&system_message);
     let llm = inference::LlamaLlm::new(&backend, model.clone(), &initial_tokens);

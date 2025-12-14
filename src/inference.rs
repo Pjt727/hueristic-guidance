@@ -46,8 +46,8 @@ pub struct LlamaLlm {
 impl LlamaLlm {
     /// if the initial tokens has been saved it will try to load from there
     pub fn new(backend: &LlamaBackend, model: Arc<LlamaModel>, initial_tokens: &[TokenID]) -> Self {
-        let batch_size = 512_u32;
-        let context_size = 2048;
+        let batch_size = 2048_u32;  // Increased to handle large system prompt (~1400-1600 tokens)
+        let context_size = 8192;    // Increased for extended conversations (5+ exchanges)
         let seq_id = 0;
         let ctx_params = LlamaContextParams::default()
             .with_n_ctx(Some(NonZero::new(context_size).unwrap())) // Context size

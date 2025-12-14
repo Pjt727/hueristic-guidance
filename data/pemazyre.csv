@@ -1,0 +1,90 @@
+Category	Kind	Description	VC Agent Message	VC Agent Message - URLs
+General Info	PHARMA	HCP is asking for information about Pemazyre / the brand	"You can learn more about PEMAZYRE® (pemigatinib) on the HCP site [https://docupdate.io/x1]
+
+{{conversation_continuer}}"	"You can learn more about PEMAZYRE® (pemigatinib) on the HCP site https://hcp.pemazyre.com/ 
+
+{{conversation_continuer}}"
+General Inquires	VC	HCP is seeking more information about how the VC works / what they can access through the VC	"You can respond here for PEMAZYRE® (pemigatinib) resources such as NGS testing, efﬁcacy & safety, dosing & administration, MOA, case studies and information on access.
+
+{{conversation_continuer}}"	N/A
+Resources	PHARMA	HCP requests for materials, documents, brochures, flashcards, etc, or resources without specifying type	"You can ﬁnd resources for PEMAZYRE® (pemigatinib) here [https://docupdate.io/x1]
+
+{{conversation_continuer}}"	"You can ﬁnd resources for PEMAZYRE® (pemigatinib) here https://hcp.pemazyre.com/ 
+
+{{conversation_continuer}}"
+Representative Request	PHARMA	HCP requests to speak with or be contacted by a sales / brand representative, field force, etc	"Please provide your email address and an Incyte representative will reach out to you within 5 business days.
+
+{{conversation_continuer}}"	N/A
+Efficacy	PHARMA	HCP requests information about how well the drug works, clinical trial results, or effectiveness data	"You can ﬁnd the long-term data for PEMAZYRE® (pemigatinib) here [https://docupdate.io/x1]
+
+If you would like to explore more efﬁcacy and safety data click here [https://docupdate.io/x2] 
+
+{{conversation_continuer}}"	"You can ﬁnd the long-term data for PEMAZYRE® (pemigatinib) here https://hcp.pemazyre.com/4year-analysis 
+
+If you would like to explore more efﬁcacy and safety data click here https://hcp.pemazyre.com/efficacy 
+
+{{conversation_continuer}}"
+Safety	PHARMA	HCP requests information about side effects, adverse events, contraindications, or safety profile	"You can ﬁnd safety data on PEMAZYRE® (pemigatinib) here [https://docupdate.io/x1]
+{{conversation_continuer}}"	"You can ﬁnd safety data on PEMAZYRE® (pemigatinib) here https://hcp.pemazyre.com/safety-side-effects 
+
+{{conversation_continuer}}"
+Testing	PHARMA	HCPs requesting information about Next-Generation Sequencing (NGS) testing to identify FGFR2 fusions or rearrangements in cholangiocarcinoma patients. NGS testing is required to determine patient eligibility for the drug, as the drug is indicated only for patients with FGFR2 fusions/rearrangements detected by an FDA-approved test	"You can ﬁnd information on NGS testing here [https://docupdate.io/x1]
+
+{{conversation_continuer}}"	"You can ﬁnd information on NGS testing here https://hcp.pemazyre.com/fgfr2-fusion-testing 
+
+{{conversation_continuer}}"
+Dosing	PHARMA	HCP requests information about dosage, administration, how to prescribe, or dosing instructions	"Here’s a link to the dosing & administration page [https://docupdate.io/x1]
+
+{{conversation_continuer}}"	"Here’s a link to the dosing & administration page https://hcp.pemazyre.com/dosing 
+
+{{conversation_continuer}}"
+Adverse Reactions	PHARMA	HCP is asking about the expected or known side effects and adverse reactions associated with treatment	"Review information on the management of adverse reactions here [https://docupdate.io/x1]
+
+{{conversation_continuer}}"	"Review information on the management of adverse reactions here https://hcp.pemazyre.com/adverse-reactions
+
+{{conversation_continuer}}"
+Mechanism of Action	PHARMA	HCP requests information about how the drug works biologically	"You can ﬁnd more information on the MOA of PEMAZYRE® (pemigatinib) here [https://docupdate.io/x1]
+
+{{conversation_continuer}}"	"You can ﬁnd more information on the MOA of PEMAZYRE® (pemigatinib) here https://hcp.pemazyre.com/mechanism-of-action
+
+{{conversation_continuer}}"
+Video for KOL	PHARMA	HCPs requests access to educational videos featuring Key Opinion Leaders (KOLs) or expert physicians	"Click here to listen to gastrointestinal oncologists discuss a variety of topics including treatment with PEMAZYRE® (pemigatinib) [https://docupdate.io/x1]
+
+{{conversation_continuer}}"	"Click here to listen to gastrointestinal oncologists discuss a variety of topics including treatment with PEMAZYRE® (pemigatinib) https://hcp.pemazyre.com/expert-video-series
+
+{{conversation_continuer}}"
+Patient Profiles	PHARMA	HCP requests specific patient profile information, case examples, or patient characteristics	"View patient case studies here [https://docupdate.io/x1]
+
+{{conversation_continuer}}"	"View patient case studies here https://hcp.pemazyre.com/patient-case-studies
+
+{{conversation_continuer}}"
+Access	PHARMA	HCP asks about how patients can access or obtain the drug. Broader than cost reduction / savings card - it encompasses the entire process of getting the medication to patients	"You can ﬁnd information on access & patient support here [https://docupdate.io/x1]
+{{conversation_continuer}}"	"You can ﬁnd information on access & patient support here https://hcp.pemazyre.com/access-support 
+
+{{conversation_continuer}}"
+incytecares	PHARMA	HCP asks about the IncyteCARES savings program	"For more information on IncyteCARES, visit [https://docupdate.io/x1]
+
+{{conversation_continuer}}"	"For more information on IncyteCARES, visit https://www.incytecares.com/ 
+
+{{conversation_continuer}}"
+Prescribing Information	PHARMA	HCP requests the full prescribing information (package insert/FDA-approved labeling)	"Here’s a link to the PEMAZYRE® (pemigatinib) Prescribing Information [https://docupdate.io/x1]
+
+{{conversation_continuer}}"	"Here’s a link to the PEMAZYRE® (pemigatinib) Prescribing Information https://www.pemazyre.com/pemazyre-prescribing-information 
+
+{{conversation_continuer}}"
+Medical Information	PHARMA	HCP is asking for support from the brand's medical / science team	Here is the medical information site for Incyte [https://docupdate.io/x1] or you can email medinfo@incyte.com. Incyte will be happy to answer any general product-related questions. However, they cannot recommend treatment or offer medical advice.
+	"Here is the medical information site for Incyte https://www.incytemi.com/ or you can email medinfo@incyte.com. Incyte will be happy to answer any general product-related questions. However, they cannot recommend treatment or offer medical advice.
+"
+Treatment Recommendation	PHARMA	HCP is asking for treatment recommendations or advice on how to treat patients / what to do in certain scenarios	"I'm here to help connect you with PEMAZYRE® (pemigatinib) resources when you need them. I cannot recommend treatment or offer medical advice. Review the Incyte medical information site for assistance [https://docupdate.io/x1]
+"	I'm here to help connect you with PEMAZYRE® (pemigatinib) resources when you need them. I cannot recommend treatment or offer medical advice. Review the Incyte medical information site for assistance https://www.incytemi.com/ 
+adverse_event	PHARMA	HCP reports or inquires about reporting adverse events or side effects experienced by patients	"Your message contains a potential Adverse Event (AE) that will be forwarded to the Incyte drug safety department for AE reporting purposes. You can also report side effects to the Incyte Medical Information team at 1-855-463-3463.
+"	N/A
+Clarifying Question	VC	VC seeks clarity from the HCP	Sorry your request could not be processed, could you please clarify? Additionally, here's the link to the HCP site [https://docupdate.io/x1]
+Not Relevant	VC	HCP says "not relevant"	"You have been unsubscribed. Please visit https://www.docupdate.io/manage-preferences to manage your preferences.
+"	N/A
+Opt Out	VC	HCP opts out of the VC	"You can unsubscribe by replying “not relevant”.
+"	N/A
+Help	VC	HCP says "help"	"Contact support@docupdate.io for inquiries or feedback.
+
+Reply “not relevant” to unsubscribe from the Virtual Coordinator.
+"	N/A
