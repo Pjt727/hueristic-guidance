@@ -1,13 +1,13 @@
 use std::io;
 use std::sync::Arc;
 
-use llguidance::toktrie::TokenizerEnv;
 use llguidance::Constraint;
+use llguidance::toktrie::TokenizerEnv;
 
 use crate::grammar::GrammarFlow;
 
 use crate::inference::Llm;
-use crate::llama_tokenizer::{LlamaTokenizerEnv, END_TURN_TOKEN, ID_END_TOKEN, ID_START_TOKEN};
+use crate::llama_tokenizer::{END_TURN_TOKEN, ID_END_TOKEN, ID_START_TOKEN, LlamaTokenizerEnv};
 use crate::token::Canidate;
 
 pub struct ConversationInfo {
@@ -57,7 +57,7 @@ impl ConversationData {
         let initial_prompt = format!(
             "{ID_START_TOKEN}user{ID_END_TOKEN}{input}{END_TURN_TOKEN}{ID_START_TOKEN}assistant{ID_END_TOKEN}{}",
             self.running_input
-            );
+        );
         let initial_tokens = self.tokenizer.tokenize(&initial_prompt);
         self.llm.feed_tokens(&initial_tokens);
 
@@ -132,4 +132,41 @@ impl ConversationData {
             )
         }
     }
+}
+
+struct CategoryBias {
+    category: String,
+    bias: f32,
+}
+
+struct ScaledCanidate {
+    canidate: Canidate,
+    total_bias: usize,
+    bias_count: usize,
+}
+
+fn get_margins() -> Vec<(CategoryBias, f32)> {
+    vec![]
+}
+
+fn get_biased_canidates(
+    margins: Vec<(CategoryBias, f32)>,
+    candidates: Vec<Canidate>,
+) -> Vec<Canidate> {
+    let mut scaled_canidates = candidates
+        .iter()
+        .cloned()
+        .map(|c| ScaledCanidate {
+            canidate: c,
+            total_bias: 0,
+            bias_count: 0,
+        })
+        .collect::<Vec<_>>();
+
+    for (bias, scale) in margins {
+        // for scaled_canidate in scaled_canidates.iter_mut() {
+        //     if bias.category.is_prefix_of(scaled_canidate.canidate)
+        // }
+    }
+    vec![]
 }

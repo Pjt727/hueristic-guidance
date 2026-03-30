@@ -13,6 +13,13 @@ Use llguidance to fast-forward templated text
 Each time we need the LLM's inference for the next token that is a *critical point*.
 Use heuristic data to massage logits at critical points to what gets the best results for the validation set.
 
+
 # algorithm
 VC for one critical point
 ![algorithm](assets/algo.png)
+
+
+training process:
+- normal embedding only iterative approach
+
+c
