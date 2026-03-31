@@ -1,0 +1,15 @@
+[build]
+target = "index.html"
+
+# Proxy API calls to the Axum server during development
+[[proxy]]
+backend = "http://localhost:3000/infer"
+rewrite = "/infer"
+
+[[proxy]]
+backend = "http://localhost:3000/health"
+rewrite = "/health"
+
+[[proxy]]
+backend = "http://localhost:3000/agents"
+rewrite = "/agents"

@@ -1,3 +1,17 @@
 /target
 models/
 context_cache/
+
+# Environment
+.env
+
+# SQLite database files
+*.db
+*.db-shm
+*.db-wal
+
+# Frontend build output
+crates/frontend/dist/
+
+# sqlx query cache
+.sqlx/

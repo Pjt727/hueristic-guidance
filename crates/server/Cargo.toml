@@ -1,0 +1,29 @@
+[package]
+name    = "server"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "server"
+path = "src/main.rs"
+
+[dependencies]
+inference    = { path = "../inference" }
+inference-types = { path = "../inference-types" }
+anyhow       = { workspace = true }
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+tokio        = { workspace = true }
+tracing      = { workspace = true }
+axum         = { version = "0.8", features = ["macros"] }
+tower-http   = { version = "0.6", features = ["cors", "trace"] }
+# SQLite — application-owned tables (compile-time checked via query!)
+# Postgres — marketing VC database (read-only, runtime queries)
+sqlx         = { version = "0.8", features = ["runtime-tokio", "sqlite", "postgres", "macros", "migrate"] }
+uuid         = { version = "1", features = ["v4", "serde"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+futures-core        = "0.3"
+futures             = "0.3"
+tracing-subscriber  = { version = "0.3", features = ["env-filter"] }
+reqwest             = { version = "0.12", features = ["json"] }
+pgvector            = { version = "0.4", features = ["sqlx"] }

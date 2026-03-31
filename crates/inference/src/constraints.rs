@@ -24,6 +24,5 @@ pub fn new_default_constraint(grammar_flow: &GrammarFlow, tok_env: &TokEnv) -> C
         .create_parser_from_init_default(GrammarInit::Serialized(grammar))
         .unwrap();
 
-    // get the constraint object which is used to compute the masks
     Constraint::new(token_parser)
 }

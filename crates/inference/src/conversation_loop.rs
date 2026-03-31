@@ -35,19 +35,13 @@ impl ConversationData {
             running_input: "".to_string(),
         }
     }
+
     pub fn simple_hitl_generation(&mut self, max_tokens: usize, top_candidate_count: usize) {
         let initial_tokens = self.constraint.process_prompt(vec![]);
         self.llm.feed_tokens(&initial_tokens);
 
         self.running_input = self.tokenizer.tokens_to_string(&initial_tokens);
 
-        // dbg!(self.constraint.parser.dump_state());
-        // self.constraint
-        //     .commit_token(Some(self.tokenizer.tokenize(END_TURN_TOKEN_TOKEN)[0]))
-        //     .unwrap();
-        // dbg!(self.constraint.parser.dump_state());
-
-        // get an initial user prompt
         let mut input = String::new();
         io::stdin()
             .read_line(&mut input)
@@ -73,8 +67,7 @@ impl ConversationData {
         println!("Conversation complete: ```\n{}\n```", self.running_input);
     }
 
-    /// find the next token to commit and commits it, also forces any of the next tokens
-    /// returns whether the grammar is done
+    /// Commit one token (plus any fast-forward tokens). Returns `true` to continue.
     pub fn commit_inference(&mut self, top_candidate_count: usize) -> bool {
         let mut canidates = self.llm.get_canidates();
         let premask_top = canidates.top_n(top_candidate_count);
@@ -90,19 +83,16 @@ impl ConversationData {
         println!("\n\nTop {top_candidate_count} masked tokens:");
         self.print_canidates(&mask_top);
 
-        // choose the top masked
         let last_token = mask_top.first().unwrap().token_id;
 
         let last_commit_result = self.constraint.commit_token(Some(last_token)).unwrap();
         let ff_tokens = last_commit_result.ff_tokens;
 
-        // commit the ff_tokens to the constraint and the llm
         let mut last_commit_result = None;
         for token in ff_tokens.iter().skip(1) {
             last_commit_result = Some(self.constraint.commit_token(Some(*token)).unwrap())
         }
 
-        // the ff tokens would include the current token
         if ff_tokens.is_empty() {
             self.llm.feed_tokens(&[last_token]);
             self.running_input += &self.tokenizer.tokens_to_string(&[last_token]);
@@ -117,7 +107,7 @@ impl ConversationData {
             return !commit_result.stop;
         }
 
-        return true;
+        true
     }
 
     pub fn grammar_test(&mut self) {}
@@ -153,7 +143,7 @@ fn get_biased_canidates(
     margins: Vec<(CategoryBias, f32)>,
     candidates: Vec<Canidate>,
 ) -> Vec<Canidate> {
-    let mut scaled_canidates = candidates
+    let _scaled_canidates = candidates
         .iter()
         .cloned()
         .map(|c| ScaledCanidate {
@@ -163,10 +153,6 @@ fn get_biased_canidates(
         })
         .collect::<Vec<_>>();
 
-    for (bias, scale) in margins {
-        // for scaled_canidate in scaled_canidates.iter_mut() {
-        //     if bias.category.is_prefix_of(scaled_canidate.canidate)
-        // }
-    }
+    for (_bias, _scale) in margins {}
     vec![]
 }

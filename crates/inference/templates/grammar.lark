@@ -1,0 +1,1 @@
+start: {% for lit in response_literals %}{% if !loop.first %} | {% endif %}{{ lit }}{% endfor %}
