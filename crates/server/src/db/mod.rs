@@ -207,6 +207,290 @@ pub async fn load_vc_messages(
 }
 
 // ---------------------------------------------------------------------------
+// Bulk test — Postgres (read-only)
+// ---------------------------------------------------------------------------
+
+/// One HCP example message used as a test prompt.
+pub struct HcpExample {
+    pub id: i32,
+    pub text: String,
+}
+
+/// A VC message with its Postgres primary key.
+pub struct VcMessageWithId {
+    pub id: i32,
+    pub vc_message: VCmessage,
+}
+
+/// Load all HCP example messages for the latest version of `agent_id`.
+pub async fn load_hcp_example_messages(
+    vc_db: &PgPool,
+    agent_id: i32,
+) -> anyhow::Result<Vec<HcpExample>> {
+    #[derive(sqlx::FromRow)]
+    struct Row {
+        id: Option<i32>,
+        textcontent: Option<String>,
+    }
+
+    let rows = sqlx::query_as::<_, Row>(
+        r#"SELECT id, textcontent
+           FROM vchcpexamplemessages
+           WHERE agentid  = $1
+             AND versionid = (SELECT MAX(versionid) FROM vchcpexamplemessages WHERE agentid = $1)
+             AND textcontent IS NOT NULL"#,
+    )
+    .bind(agent_id)
+    .fetch_all(vc_db)
+    .await
+    .with_context(|| format!("failed to load HCP example messages for agent {agent_id}"))?;
+
+    let examples = rows
+        .into_iter()
+        .filter_map(|r| {
+            Some(HcpExample {
+                id: r.id?,
+                text: r.textcontent?.trim().to_string(),
+            })
+        })
+        .filter(|e| !e.text.is_empty())
+        .collect();
+
+    Ok(examples)
+}
+
+/// Load the correct-answer map for all HCP examples of the latest version of
+/// `agent_id`. Returns a HashMap from `examplemessageid` → `Vec<messageid>`.
+pub async fn load_correct_answer_map(
+    vc_db: &PgPool,
+    agent_id: i32,
+) -> anyhow::Result<std::collections::HashMap<i32, Vec<i32>>> {
+    #[derive(sqlx::FromRow)]
+    struct Row {
+        examplemessageid: Option<i32>,
+        messageid: Option<i32>,
+    }
+
+    let rows = sqlx::query_as::<_, Row>(
+        r#"SELECT j.examplemessageid, j.messageid
+           FROM vcmessagestohcpexamplemessages j
+           JOIN vchcpexamplemessages h ON h.id = j.examplemessageid
+           WHERE h.agentid   = $1
+             AND h.versionid = (SELECT MAX(versionid) FROM vchcpexamplemessages WHERE agentid = $1)"#,
+    )
+    .bind(agent_id)
+    .fetch_all(vc_db)
+    .await
+    .with_context(|| format!("failed to load correct answer map for agent {agent_id}"))?;
+
+    let mut map: std::collections::HashMap<i32, Vec<i32>> = std::collections::HashMap::new();
+    for r in rows {
+        if let (Some(eid), Some(mid)) = (r.examplemessageid, r.messageid) {
+            map.entry(eid).or_default().push(mid);
+        }
+    }
+    Ok(map)
+}
+
+/// Like `load_vc_messages` but also returns the Postgres `id` for each row.
+pub async fn load_vc_messages_with_ids(
+    vc_db: &PgPool,
+    agent_id: i32,
+) -> anyhow::Result<Vec<VcMessageWithId>> {
+    #[derive(sqlx::FromRow)]
+    struct Row {
+        id: Option<i32>,
+        categoryname: Option<String>,
+        categorydescription: Option<String>,
+        textcontent: Option<String>,
+    }
+
+    let rows = sqlx::query_as::<_, Row>(
+        r#"SELECT id, categoryname, categorydescription, textcontent
+           FROM vcmessages
+           WHERE agentid    = $1
+             AND textcontent   IS NOT NULL
+             AND categoryname  IS NOT NULL
+             AND categoryname  != 'conversation_flow'
+             AND textcontent NOT LIKE '%{{conversation_flow}}%'
+             AND textcontent   != 'N/A'"#,
+    )
+    .bind(agent_id)
+    .fetch_all(vc_db)
+    .await
+    .context("failed to load vcmessages with IDs from marketing DB")?;
+
+    let messages = rows
+        .into_iter()
+        .filter_map(|r| {
+            let id = r.id?;
+            let category = r.categoryname?.trim().to_string();
+            let description = r.categorydescription.unwrap_or_default().trim().to_string();
+            let raw_text = r.textcontent?;
+            let message = raw_text
+                .replace("{{conversation_continuer}}", "")
+                .trim()
+                .to_string();
+            if message.is_empty() || category.starts_with("qpharma.") {
+                return None;
+            }
+            Some(VcMessageWithId {
+                id,
+                vc_message: VCmessage {
+                    category,
+                    kind: String::new(),
+                    description,
+                    mlr_message: message.clone(),
+                    message,
+                },
+            })
+        })
+        .collect();
+
+    Ok(messages)
+}
+
+// ---------------------------------------------------------------------------
+// Bulk test persistence — SQLite
+// Uses sqlx::query (no !) to avoid offline cache regeneration for new tables.
+// ---------------------------------------------------------------------------
+
+/// Create a new bulk test run row and return its SQLite row ID.
+pub async fn create_bulk_test_run(db: &SqlitePool, agent_id: i32) -> anyhow::Result<i64> {
+    let aid = agent_id as i64;
+    let result = sqlx::query!(
+        "INSERT INTO bulk_test_runs (agent_id) VALUES (?)",
+        aid,
+    )
+    .execute(db)
+    .await
+    .context("failed to insert bulk_test_run")?;
+    Ok(result.last_insert_rowid())
+}
+
+/// Persist one example result within a bulk test run.
+pub async fn insert_bulk_test_result(
+    db: &SqlitePool,
+    run_id: i64,
+    example_id: i32,
+    example_text: &str,
+    chosen_category: Option<&str>,
+    correct_categories_json: &str,
+    success: bool,
+    steps_json: &str,
+) -> anyhow::Result<()> {
+    let eid = example_id as i64;
+    let ok = success as i64;
+    sqlx::query!(
+        "INSERT INTO bulk_test_results \
+         (run_id, example_id, example_text, chosen_category, correct_categories, success, steps) \
+         VALUES (?, ?, ?, ?, ?, ?, ?)",
+        run_id,
+        eid,
+        example_text,
+        chosen_category,
+        correct_categories_json,
+        ok,
+        steps_json,
+    )
+    .execute(db)
+    .await
+    .context("failed to insert bulk_test_result")?;
+    Ok(())
+}
+
+/// Mark a run as finished and store the final totals.
+pub async fn complete_bulk_test_run(
+    db: &SqlitePool,
+    run_id: i64,
+    total: i64,
+    success_count: i64,
+) -> anyhow::Result<()> {
+    sqlx::query!(
+        "UPDATE bulk_test_runs \
+         SET completed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), \
+             total = ?, success_count = ? \
+         WHERE id = ?",
+        total,
+        success_count,
+        run_id,
+    )
+    .execute(db)
+    .await
+    .context("failed to complete bulk_test_run")?;
+    Ok(())
+}
+
+#[derive(serde::Serialize)]
+pub struct BulkTestRunSummary {
+    pub id: i64,
+    pub agent_id: i64,
+    pub started_at: String,
+    pub completed_at: Option<String>,
+    pub total: Option<i64>,
+    pub success_count: Option<i64>,
+}
+
+/// List the 50 most recent bulk test runs (newest first).
+pub async fn list_bulk_test_runs(db: &SqlitePool) -> anyhow::Result<Vec<BulkTestRunSummary>> {
+    let rows = sqlx::query!(
+        "SELECT id, agent_id, started_at, completed_at, total, success_count \
+         FROM bulk_test_runs ORDER BY started_at DESC LIMIT 50"
+    )
+    .fetch_all(db)
+    .await
+    .context("failed to list bulk_test_runs")?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| BulkTestRunSummary {
+            id: r.id,
+            agent_id: r.agent_id,
+            started_at: r.started_at,
+            completed_at: r.completed_at,
+            total: r.total,
+            success_count: r.success_count,
+        })
+        .collect())
+}
+
+pub struct StoredBulkTestResult {
+    pub example_id: i64,
+    pub example_text: String,
+    pub chosen_category: Option<String>,
+    pub correct_categories_json: String,
+    pub success: bool,
+    pub steps_json: String,
+}
+
+/// Load all results for a given run, ordered by insertion.
+pub async fn load_bulk_test_results(
+    db: &SqlitePool,
+    run_id: i64,
+) -> anyhow::Result<Vec<StoredBulkTestResult>> {
+    let rows = sqlx::query!(
+        "SELECT example_id, example_text, chosen_category, correct_categories, success, steps \
+         FROM bulk_test_results WHERE run_id = ? ORDER BY id",
+        run_id,
+    )
+    .fetch_all(db)
+    .await
+    .context("failed to load bulk_test_results")?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| StoredBulkTestResult {
+            example_id: r.example_id,
+            example_text: r.example_text,
+            chosen_category: r.chosen_category,
+            correct_categories_json: r.correct_categories,
+            success: r.success != 0,
+            steps_json: r.steps,
+        })
+        .collect())
+}
+
+// ---------------------------------------------------------------------------
 // Embedding margin scores — Postgres
 // ---------------------------------------------------------------------------
 

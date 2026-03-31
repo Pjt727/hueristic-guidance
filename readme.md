@@ -21,5 +21,3 @@ VC for one critical point
 
 training process:
 - normal embedding only iterative approach
-
-c

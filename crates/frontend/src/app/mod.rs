@@ -4,10 +4,48 @@ pub mod components;
 use inference_types::StepCandidates;
 use leptos::prelude::*;
 
-use components::{AgentSelector, CandidatePanel, PromptInput, TokenStreamView};
+use components::{AgentSelector, BulkTestPage, CandidatePanel, PromptInput, TokenStreamView};
+
+#[derive(Clone, Copy, PartialEq)]
+enum Page {
+    Inference,
+    BulkTest,
+}
 
 #[component]
 pub fn App() -> impl IntoView {
+    let (page, set_page) = signal(Page::Inference);
+
+    view! {
+        <div>
+            // Page navigation
+            <nav style="display:flex; gap:0.5rem; margin-bottom:1rem;">
+                <button
+                    class=move || if page.get() == Page::Inference { "btn-active" } else { "" }
+                    on:click=move |_| set_page.set(Page::Inference)
+                >
+                    "Inference"
+                </button>
+                <button
+                    class=move || if page.get() == Page::BulkTest { "btn-active" } else { "" }
+                    on:click=move |_| set_page.set(Page::BulkTest)
+                >
+                    "Bulk Test"
+                </button>
+            </nav>
+
+            <Show when=move || page.get() == Page::Inference>
+                <InferencePage />
+            </Show>
+            <Show when=move || page.get() == Page::BulkTest>
+                <BulkTestPage />
+            </Show>
+        </div>
+    }
+}
+
+#[component]
+fn InferencePage() -> impl IntoView {
     let (prompt, set_prompt) = signal(String::new());
     let (agent_id, set_agent_id) = signal::<Option<i32>>(None);
     let (status, set_status) = signal("Ready".to_string());

@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use inference::InferenceEngine;
-use inference_types::InferenceEvent;
+use inference_types::{BulkTestEvent, InferenceEvent};
 use sqlx::{PgPool, SqlitePool};
 use tokio::sync::{mpsc, Mutex};
 
@@ -21,4 +21,7 @@ pub struct AppState {
     /// In-memory map of session obfuscated_id → live receiver for that stream.
     /// Removed and owned by the SSE handler when the client connects.
     pub sessions: Arc<Mutex<HashMap<String, mpsc::Receiver<InferenceEvent>>>>,
+    /// In-memory map of bulk_test_id → live receiver for that bulk test stream.
+    /// Removed and owned by the SSE handler when the client connects.
+    pub bulk_test_sessions: Arc<Mutex<HashMap<String, mpsc::Receiver<BulkTestEvent>>>>,
 }

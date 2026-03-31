@@ -71,6 +71,7 @@ async fn main() -> anyhow::Result<()> {
         db,
         vc_db,
         sessions: Arc::new(Mutex::new(HashMap::new())),
+        bulk_test_sessions: Arc::new(Mutex::new(HashMap::new())),
     };
 
     // --- Router -------------------------------------------------------------
@@ -80,6 +81,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/agents/{agent_id}/system-prompt", get(routes::agents::get_system_prompt))
         .route("/infer", post(routes::infer::start_infer))
         .route("/infer/stream/{session_id}", get(routes::infer::stream_sse))
+        .route("/bulk-test", post(routes::bulk_test::start_bulk_test))
+        .route("/bulk-test/stream/{bulk_test_id}", get(routes::bulk_test::stream_bulk_test_sse))
+        .route("/bulk-tests", get(routes::bulk_test::list_bulk_tests))
+        .route("/bulk-tests/{run_id}", get(routes::bulk_test::get_bulk_test))
         .layer(CorsLayer::permissive())
         .with_state(state);
 

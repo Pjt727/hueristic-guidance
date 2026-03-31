@@ -15,3 +15,6 @@ crates/frontend/dist/
 
 # sqlx query cache
 .sqlx/
+
+.nvim.lua
+stratchpad.sql

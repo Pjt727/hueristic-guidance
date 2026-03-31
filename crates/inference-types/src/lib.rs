@@ -45,3 +45,24 @@ pub enum InferenceEvent {
     /// An error occurred during generation.
     Error { message: String },
 }
+
+/// A single test case result streamed during a bulk test run.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum BulkTestEvent {
+    /// One test case has completed.
+    Result {
+        example_id: i32,
+        example_text: String,
+        /// The chosen category name, or None if inference errored.
+        chosen_category: Option<String>,
+        /// All category names that are acceptable correct answers for this example.
+        correct_categories: Vec<String>,
+        success: bool,
+        steps: Vec<StepCandidates>,
+    },
+    /// All test cases have finished.
+    Done { total: usize, success_count: usize },
+    /// A fatal error aborted the bulk test.
+    Error { message: String },
+}

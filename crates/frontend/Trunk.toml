@@ -13,3 +13,11 @@ rewrite = "/health"
 [[proxy]]
 backend = "http://localhost:3000/agents"
 rewrite = "/agents"
+
+[[proxy]]
+backend = "http://localhost:3000/bulk-test"
+rewrite = "/bulk-test"
+
+[[proxy]]
+backend = "http://localhost:3000/bulk-tests"
+rewrite = "/bulk-tests"
