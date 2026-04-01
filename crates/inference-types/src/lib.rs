@@ -18,6 +18,11 @@ pub struct TokenWithProb {
 pub struct CategoryTopToken {
     pub category_name: String,
     pub best_token: TokenWithProb,
+    /// Raw embedding similarity margin for this category (before kappa multiplication
+    /// and before token-level averaging). Used for per-category weight optimization.
+    /// 0.0 for steps without embedding biases, and for data saved before this field existed.
+    #[serde(default)]
+    pub sim_score: f32,
 }
 
 /// Candidates at a single decoding step.

@@ -119,6 +119,32 @@ pub async fn get_or_create_kappa(db: &SqlitePool, message_id: i64) -> anyhow::Re
     Ok(row.kappa)
 }
 
+/// Overwrite the kappa value for a single message.
+pub async fn set_kappa(db: &SqlitePool, message_id: i64, kappa: f64) -> anyhow::Result<()> {
+    sqlx::query!(
+        "INSERT INTO vc_message_constants (message_id, kappa) VALUES (?, ?)
+         ON CONFLICT(message_id) DO UPDATE SET kappa = excluded.kappa",
+        message_id,
+        kappa,
+    )
+    .execute(db)
+    .await
+    .context("failed to set kappa for message")?;
+    Ok(())
+}
+
+/// Return the agent_id stored in a bulk_test_run row.
+pub async fn get_run_agent_id(db: &SqlitePool, run_id: i64) -> anyhow::Result<i64> {
+    let row = sqlx::query!(
+        "SELECT agent_id FROM bulk_test_runs WHERE id = ?",
+        run_id,
+    )
+    .fetch_one(db)
+    .await
+    .context("failed to fetch agent_id for run")?;
+    Ok(row.agent_id)
+}
+
 // ---------------------------------------------------------------------------
 // VC database — Postgres (read-only)
 // Uses sqlx::query_as with typed structs — no query! macro because this is an

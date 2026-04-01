@@ -118,6 +118,7 @@ async fn compute_category_biases(
         biases.push(CategoryBias {
             category_name: m.category_name.clone(),
             weighted_margin: (kappa * m.margin) as f32,
+            sim_score: m.margin as f32,
         });
     }
 

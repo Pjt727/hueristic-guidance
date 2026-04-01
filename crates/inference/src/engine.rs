@@ -23,6 +23,9 @@ pub struct CategoryBias {
     pub category_name: String,
     /// Pre-scaled margin: kappa * (max_pos_similarity - max_neg_similarity).
     pub weighted_margin: f32,
+    /// Raw margin before kappa multiplication: max_pos_similarity - max_neg_similarity.
+    /// Stored in CategoryTopToken.sim_score for per-category weight optimization.
+    pub sim_score: f32,
 }
 
 #[derive(Clone)]
@@ -97,6 +100,12 @@ fn run_generation_blocking(
     // per-category token ID lists for per-step "best token per category" lookup.
     let (logit_bias_map, category_info, category_token_ids) =
         build_logit_bias_map(&category_biases, &tokenizer, &inner.model);
+
+    // Build a map of category_name → raw sim_score for populating CategoryTopToken.
+    let category_sim_scores: HashMap<String, f32> = category_biases
+        .iter()
+        .map(|b| (b.category_name.clone(), b.sim_score))
+        .collect();
 
     // Tokenize the system prompt and build the LLM context (cached to disk)
     let system_prompt = grammar_flow.get_system_prompt();
@@ -215,6 +224,10 @@ fn run_generation_blocking(
                             logit: best.logit,
                             embedding_logit: best.embedding_logit,
                         },
+                        sim_score: category_sim_scores
+                            .get(cat_name.as_str())
+                            .copied()
+                            .unwrap_or(0.0),
                     })
             })
             .collect();

@@ -168,8 +168,8 @@ pub async fn fetch_bulk_test_run(run_id: i64) -> Result<Vec<TestResult>, String>
 }
 
 /// POST /bulk-test — creates a bulk test run for the given agent.
-/// Returns the bulk_test_id string on success.
-pub async fn start_bulk_test(agent_id: i32) -> Result<String, String> {
+/// Returns `(bulk_test_id, run_id)` on success.
+pub async fn start_bulk_test(agent_id: i32) -> Result<(String, i64), String> {
     let body = serde_json::json!({ "agent_id": agent_id });
     let resp = gloo_net::http::Request::post("/bulk-test")
         .header("Content-Type", "application/json")
@@ -184,10 +184,14 @@ pub async fn start_bulk_test(agent_id: i32) -> Result<String, String> {
     }
 
     let json: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
-    json["bulk_test_id"]
+    let bulk_test_id = json["bulk_test_id"]
         .as_str()
         .map(str::to_string)
-        .ok_or_else(|| "missing bulk_test_id in response".to_string())
+        .ok_or_else(|| "missing bulk_test_id in response".to_string())?;
+    let run_id = json["run_id"]
+        .as_i64()
+        .ok_or_else(|| "missing run_id in response".to_string())?;
+    Ok((bulk_test_id, run_id))
 }
 
 /// A single completed bulk test result (extracted from BulkTestEvent::Result).
@@ -199,6 +203,52 @@ pub struct TestResult {
     pub correct_categories: Vec<String>,
     pub success: bool,
     pub steps: Vec<StepCandidates>,
+}
+
+/// POST /bulk-tests/{run_id}/apply-weights — saves per-category kappa values to the DB.
+pub async fn apply_weights(
+    run_id: i64,
+    weights: &std::collections::HashMap<String, f64>,
+) -> Result<ApplyWeightsResponse, String> {
+    let body = serde_json::json!({ "weights": weights });
+    let resp = gloo_net::http::Request::post(&format!("/bulk-tests/{run_id}/apply-weights"))
+        .header("Content-Type", "application/json")
+        .body(body.to_string())
+        .map_err(|e| e.to_string())?
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if !resp.ok() {
+        return Err(format!("HTTP {}", resp.status()));
+    }
+    resp.json::<ApplyWeightsResponse>().await.map_err(|e| e.to_string())
+}
+
+/// Response from POST /bulk-tests/{run_id}/apply-weights.
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct ApplyWeightsResponse {
+    pub updated: usize,
+    pub unmatched_categories: Vec<String>,
+}
+
+/// POST /bulk-tests/{run_id}/optimize — returns optimal per-category weights.
+pub async fn optimize_weights(run_id: i64) -> Result<OptimizeResponse, String> {
+    let resp = gloo_net::http::Request::post(&format!("/bulk-tests/{run_id}/optimize"))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if !resp.ok() {
+        return Err(format!("HTTP {}", resp.status()));
+    }
+    resp.json::<OptimizeResponse>().await.map_err(|e| e.to_string())
+}
+
+/// Response from POST /bulk-tests/{run_id}/optimize.
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct OptimizeResponse {
+    pub weights: std::collections::HashMap<String, f64>,
+    pub examples_used: usize,
+    pub examples_skipped: usize,
 }
 
 /// Opens an SSE connection to GET /bulk-test/stream/:bulk_test_id.

@@ -1,9 +1,54 @@
+use std::collections::HashMap;
+
 use inference_types::StepCandidates;
 use leptos::ev;
 use leptos::prelude::*;
 
-use crate::app::api::{self, BulkTestRunSummary, TestResult};
+use crate::app::api::{self, BulkTestRunSummary, OptimizeResponse, TestResult};
 use crate::app::components::{AgentSelector, CandidatePanel, TokenStreamView};
+
+/// Estimate how many examples would be classified correctly if each category's
+/// kappa were replaced with the values in `kappas`.
+///
+/// For categories absent from `kappas`, `fallback_kappa` is used (pass `10.0`
+/// to simulate the original default, or `0.0` for logit-only).
+///
+/// Returns `(correct, total)`.  Examples with no `category_top_tokens` in any
+/// step are skipped and not counted in `total`.
+fn simulate_accuracy(
+    results: &[TestResult],
+    kappas: &HashMap<String, f64>,
+    fallback_kappa: f64,
+) -> (usize, usize) {
+    let mut correct = 0usize;
+    let mut total = 0usize;
+
+    for result in results {
+        // Find the first step that has category_top_tokens populated.
+        let Some(step) = result.steps.iter().find(|s| !s.category_top_tokens.is_empty()) else {
+            continue;
+        };
+
+        total += 1;
+
+        // Pick the category with the highest simulated total score.
+        let best = step.category_top_tokens.iter().max_by(|a, b| {
+            let kappa_a = kappas.get(&a.category_name).copied().unwrap_or(fallback_kappa);
+            let kappa_b = kappas.get(&b.category_name).copied().unwrap_or(fallback_kappa);
+            let score_a = a.best_token.logit as f64 + kappa_a * a.sim_score as f64;
+            let score_b = b.best_token.logit as f64 + kappa_b * b.sim_score as f64;
+            score_a.partial_cmp(&score_b).unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        if let Some(token) = best {
+            if result.correct_categories.contains(&token.category_name) {
+                correct += 1;
+            }
+        }
+    }
+
+    (correct, total)
+}
 
 #[component]
 pub fn BulkTestPage() -> impl IntoView {
@@ -19,6 +64,15 @@ pub fn BulkTestPage() -> impl IntoView {
     let (expanded_steps, set_expanded_steps) = signal::<Vec<StepCandidates>>(vec![]);
     // Which step (token) inside the expanded result is highlighted in CandidatePanel
     let (selected_step_idx, set_selected_step_idx) = signal::<Option<usize>>(None);
+
+    // The run_id of the currently-displayed results (set when loading a past run)
+    let (current_run_id, set_current_run_id) = signal::<Option<i64>>(None);
+    // Optimisation results
+    let (optimize_result, set_optimize_result) = signal::<Option<OptimizeResponse>>(None);
+    let (optimize_running, set_optimize_running) = signal(false);
+    let (optimize_error, set_optimize_error) = signal::<Option<String>>(None);
+    let (apply_running, set_apply_running) = signal(false);
+    let (apply_status, set_apply_status) = signal::<Option<String>>(None);
 
     // Previous runs — loaded once on mount
     let (past_runs, set_past_runs) = signal::<Vec<BulkTestRunSummary>>(vec![]);
@@ -64,7 +118,10 @@ pub fn BulkTestPage() -> impl IntoView {
 
         leptos::task::spawn_local(async move {
             match api::start_bulk_test(aid).await {
-                Ok(bulk_test_id) => {
+                Ok((bulk_test_id, run_id)) => {
+                    set_current_run_id.set(Some(run_id));
+                    set_optimize_result.set(None);
+                    set_optimize_error.set(None);
                     set_status.set(format!("Running — {bulk_test_id}"));
                     api::open_bulk_test_stream(
                         bulk_test_id,
@@ -219,6 +276,9 @@ pub fn BulkTestPage() -> impl IntoView {
                                                         set_selected_result_idx.set(None);
                                                         set_expanded_steps.set(vec![]);
                                                         set_selected_step_idx.set(None);
+                                                        set_optimize_result.set(None);
+                                                        set_optimize_error.set(None);
+                                                        set_current_run_id.set(Some(run_id));
                                                         set_status.set(format!("Loading run {run_id}…"));
                                                         leptos::task::spawn_local(async move {
                                                             match api::fetch_bulk_test_run(run_id).await {
@@ -262,6 +322,180 @@ pub fn BulkTestPage() -> impl IntoView {
                         };
                         view! { <p style="font-weight:bold;">{label}</p> }
                     }}
+                </Show>
+
+                // ── Optimise weights ─────────────────────────────────────────
+                <Show when=move || current_run_id.get().is_some() && !results.get().is_empty()>
+                    <div style="margin-top:1rem;">
+                        <button
+                            disabled=move || optimize_running.get()
+                            on:click=move |_| {
+                                let Some(rid) = current_run_id.get_untracked() else { return; };
+                                set_optimize_result.set(None);
+                                set_optimize_error.set(None);
+                                set_apply_status.set(None);
+                                set_optimize_running.set(true);
+                                leptos::task::spawn_local(async move {
+                                    match api::optimize_weights(rid).await {
+                                        Ok(resp) => {
+                                            set_optimize_result.set(Some(resp));
+                                            set_optimize_error.set(None);
+                                        }
+                                        Err(e) => set_optimize_error.set(Some(e)),
+                                    }
+                                    set_optimize_running.set(false);
+                                });
+                            }
+                        >
+                            {move || if optimize_running.get() { "Optimising…" } else { "Optimise Category Weights" }}
+                        </button>
+
+                        <Show when=move || optimize_error.get().is_some()>
+                            <p style="color:#f44336; font-size:0.85rem; margin-top:0.4rem;">
+                                {move || optimize_error.get().unwrap_or_default()}
+                            </p>
+                        </Show>
+
+                        <Show when=move || optimize_result.get().is_some()>
+                            {move || {
+                                let resp = optimize_result.get()?;
+                                let weights_for_apply = resp.weights.clone();
+
+                                // Simulated accuracy with optimised kappas.
+                                let rs = results.get();
+                                let (sim_correct, sim_total) =
+                                    simulate_accuracy(&rs, &resp.weights, 10.0);
+                                // Baseline: logit-only (kappa = 0 for all).
+                                let empty: HashMap<String, f64> = HashMap::new();
+                                let (logit_correct, logit_total) =
+                                    simulate_accuracy(&rs, &empty, 0.0);
+                                // Baseline: original kappa = 10.
+                                let (k10_correct, k10_total) =
+                                    simulate_accuracy(&rs, &empty, 10.0);
+
+                                let fmt_acc = |c: usize, t: usize| -> String {
+                                    if t == 0 { "—".into() }
+                                    else { format!("{c}/{t} ({:.0}%)", c as f64 / t as f64 * 100.0) }
+                                };
+
+                                let mut entries: Vec<(String, f64)> = resp.weights.clone().into_iter().collect();
+                                entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+                                Some(view! {
+                                    <div style="margin-top:0.75rem;">
+                                        <p style="font-size:0.82rem; color:#aaa; margin:0 0 0.5rem;">
+                                            {format!("Optimised on {} examples ({} skipped). \
+                                                      These are the new kappa values (default baseline = 10.0). \
+                                                      Higher = more embedding influence; lower = less.",
+                                                resp.examples_used, resp.examples_skipped)}
+                                        </p>
+
+                                        // Accuracy comparison table
+                                        <table style="border-collapse:collapse; font-size:0.82rem; margin-bottom:0.75rem;">
+                                            <thead>
+                                                <tr style="background:#1e1e1e;">
+                                                    <th style="text-align:left; padding:3px 12px">"Scenario"</th>
+                                                    <th style="text-align:right; padding:3px 12px">"Accuracy"</th>
+                                                </tr>
+                                            </thead>
+                                            <tbody>
+                                                <tr style="border-bottom:1px solid #2a2a2a;">
+                                                    <td style="padding:3px 12px; color:#aaa;">"Logit only (kappa = 0)"</td>
+                                                    <td style="padding:3px 12px; text-align:right; font-family:monospace;">
+                                                        {fmt_acc(logit_correct, logit_total)}
+                                                    </td>
+                                                </tr>
+                                                <tr style="border-bottom:1px solid #2a2a2a;">
+                                                    <td style="padding:3px 12px; color:#aaa;">"Default (kappa = 10)"</td>
+                                                    <td style="padding:3px 12px; text-align:right; font-family:monospace;">
+                                                        {fmt_acc(k10_correct, k10_total)}
+                                                    </td>
+                                                </tr>
+                                                <tr>
+                                                    <td style="padding:3px 12px; font-weight:bold;">"Optimised kappas (estimated)"</td>
+                                                    <td style=format!(
+                                                        "padding:3px 12px; text-align:right; font-family:monospace; \
+                                                         font-weight:bold; color:{};",
+                                                        if sim_correct >= k10_correct { "#4caf50" } else { "#f44336" }
+                                                    )>
+                                                        {fmt_acc(sim_correct, sim_total)}
+                                                    </td>
+                                                </tr>
+                                            </tbody>
+                                        </table>
+                                        <table style="border-collapse:collapse; font-size:0.85rem; min-width:340px;">
+                                            <thead>
+                                                <tr style="background:#1e1e1e;">
+                                                    <th style="text-align:left; padding:3px 10px">"Category"</th>
+                                                    <th style="text-align:right; padding:3px 10px">"Optimal kappa"</th>
+                                                    <th style="text-align:right; padding:3px 10px">"Δ from 10.0"</th>
+                                                </tr>
+                                            </thead>
+                                            <tbody>
+                                                {entries.into_iter().map(|(cat, w)| {
+                                                    let delta = w - 10.0;
+                                                    let delta_color = if delta > 0.5 { "#4caf50" }
+                                                                      else if delta < -0.5 { "#f44336" }
+                                                                      else { "#aaa" };
+                                                    let delta_str = format!("{:+.3}", delta);
+                                                    view! {
+                                                        <tr style="border-bottom:1px solid #2a2a2a;">
+                                                            <td style="padding:3px 10px; font-family:monospace;">{cat}</td>
+                                                            <td style="padding:3px 10px; text-align:right; font-family:monospace;">
+                                                                {format!("{:.4}", w)}
+                                                            </td>
+                                                            <td style=format!("padding:3px 10px; text-align:right; \
+                                                                              font-family:monospace; color:{delta_color};")>
+                                                                {delta_str}
+                                                            </td>
+                                                        </tr>
+                                                    }
+                                                }).collect_view()}
+                                            </tbody>
+                                        </table>
+                                        <div style="margin-top:0.75rem; display:flex; align-items:center; gap:0.75rem;">
+                                            <button
+                                                disabled=move || apply_running.get()
+                                                on:click={
+                                                    let weights = weights_for_apply.clone();
+                                                    move |_| {
+                                                        let Some(rid) = current_run_id.get_untracked() else { return; };
+                                                        let weights = weights.clone();
+                                                        set_apply_running.set(true);
+                                                        set_apply_status.set(None);
+                                                        leptos::task::spawn_local(async move {
+                                                            match api::apply_weights(rid, &weights).await {
+                                                                Ok(r) => {
+                                                                    let msg = if r.unmatched_categories.is_empty() {
+                                                                        format!("Saved — {} message(s) updated.", r.updated)
+                                                                    } else {
+                                                                        format!(
+                                                                            "Saved — {} message(s) updated. Unmatched: {}",
+                                                                            r.updated,
+                                                                            r.unmatched_categories.join(", ")
+                                                                        )
+                                                                    };
+                                                                    set_apply_status.set(Some(msg));
+                                                                }
+                                                                Err(e) => set_apply_status.set(Some(format!("Error: {e}"))),
+                                                            }
+                                                            set_apply_running.set(false);
+                                                        });
+                                                    }
+                                                }
+                                            >
+                                                {move || if apply_running.get() { "Saving…" } else { "Apply These Kappas" }}
+                                            </button>
+                                            <Show when=move || apply_status.get().is_some()>
+                                                <span style="font-size:0.82rem; color:#aaa;">
+                                                    {move || apply_status.get().unwrap_or_default()}
+                                                </span>
+                                            </Show>
+                                        </div>
+                                    </div>
+                                })
+                            }}
+                        </Show>
+                    </div>
                 </Show>
 
                 // Results table

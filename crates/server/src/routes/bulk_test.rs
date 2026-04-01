@@ -56,6 +56,7 @@ pub struct BulkTestRequest {
 #[derive(Serialize)]
 pub struct BulkTestResponse {
     pub bulk_test_id: String,
+    pub run_id: i64,
 }
 
 /// POST /bulk-test
@@ -339,7 +340,7 @@ pub async fn start_bulk_test(
         }
     });
 
-    Ok(Json(BulkTestResponse { bulk_test_id }))
+    Ok(Json(BulkTestResponse { bulk_test_id, run_id }))
 }
 
 /// Compute per-category embedding biases from a pre-fetched embedding vector.
@@ -367,6 +368,7 @@ async fn compute_category_biases_from_embedding(
         biases.push(CategoryBias {
             category_name: m.category_name.clone(),
             weighted_margin: (kappa * m.margin) as f32,
+            sim_score: m.margin as f32,
         });
     }
     biases

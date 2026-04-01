@@ -1,5 +1,6 @@
 mod db;
 mod embedding;
+mod optimize;
 mod routes;
 mod state;
 
@@ -85,6 +86,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/bulk-test/stream/{bulk_test_id}", get(routes::bulk_test::stream_bulk_test_sse))
         .route("/bulk-tests", get(routes::bulk_test::list_bulk_tests))
         .route("/bulk-tests/{run_id}", get(routes::bulk_test::get_bulk_test))
+        .route("/bulk-tests/{run_id}/optimize", post(routes::optimize::optimize_weights))
+        .route("/bulk-tests/{run_id}/apply-weights", post(routes::optimize::apply_weights))
         .layer(CorsLayer::permissive())
         .with_state(state);
 
