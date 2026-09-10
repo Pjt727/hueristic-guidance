@@ -1,0 +1,31 @@
+[package]
+name    = "classifiers"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow      = { workspace = true }
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+tracing     = { workspace = true }
+async-trait = "0.1"
+reqwest     = { version = "0.12", features = ["json"] }
+
+[features]
+default = []
+onnx    = ["dep:ort", "dep:tokenizers"]
+
+[dependencies.ort]
+version  = "2.0.0-rc.12"
+optional = true
+
+[dependencies.tokenizers]
+version  = "0.21"
+optional = true
+default-features = false
+
+[dev-dependencies]
+tokio = { workspace = true }
+
+[lib]
+name = "classifiers"

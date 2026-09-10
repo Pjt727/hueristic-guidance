@@ -2,6 +2,7 @@
 members = [
     "crates/inference-types",
     "crates/inference",
+    "crates/classifiers",
     "crates/server",
     "crates/frontend",
 ]

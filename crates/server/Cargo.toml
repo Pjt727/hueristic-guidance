@@ -10,6 +10,7 @@ path = "src/main.rs"
 [dependencies]
 inference    = { path = "../inference" }
 inference-types = { path = "../inference-types" }
+classifiers  = { path = "../classifiers" }
 anyhow       = { workspace = true }
 serde        = { workspace = true }
 serde_json   = { workspace = true }
@@ -26,4 +27,5 @@ futures-core        = "0.3"
 futures             = "0.3"
 tracing-subscriber  = { version = "0.3", features = ["env-filter"] }
 reqwest             = { version = "0.12", features = ["json"] }
+dotenvy             = "0.15"
 pgvector            = { version = "0.4", features = ["sqlx"] }

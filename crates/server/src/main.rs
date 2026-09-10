@@ -22,6 +22,8 @@ use crate::state::AppState;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    dotenvy::dotenv().ok();
+
     tracing_subscriber::registry()
         .with(tracing_subscriber::EnvFilter::new(
             std::env::var("RUST_LOG").unwrap_or_else(|_| "server=info,tower_http=debug".into()),
@@ -65,6 +67,24 @@ async fn main() -> anyhow::Result<()> {
 
     let brand_name = std::env::var("BRAND_NAME").unwrap_or_else(|_| "Pemazyre".to_string());
 
+    // --- Standalone classifiers ---------------------------------------------
+    // Initialize classifiers based on available models/API keys.
+    // TF-IDF is always available; embedding classifiers depend on API key / model file.
+    let classifiers: Vec<Arc<dyn classifiers::Classifier>> = {
+        // Load a default set of category definitions for classifier initialization.
+        // These will be used for the TF-IDF vocabulary/IDF computation.
+        // When classifying for a specific agent, categories are passed to classify().
+        // TF-IDF is rebuilt per-agent at request time if categories differ, but having
+        // a default ensures the classifier is available immediately.
+        // Classifiers are built per-request with agent-specific categories.
+        // We log which methods will be available.
+        tracing::info!("TF-IDF classifier available (initialized per-request with agent categories)");
+        if std::env::var("OPENAI_API_KEY").is_ok() {
+            tracing::info!("OpenAI embedding classifier available (API key set)");
+        }
+        vec![]
+    };
+
     // --- App state ----------------------------------------------------------
     let state = AppState {
         engine,
@@ -73,6 +93,7 @@ async fn main() -> anyhow::Result<()> {
         vc_db,
         sessions: Arc::new(Mutex::new(HashMap::new())),
         bulk_test_sessions: Arc::new(Mutex::new(HashMap::new())),
+        classifiers,
     };
 
     // --- Router -------------------------------------------------------------
@@ -88,6 +109,11 @@ async fn main() -> anyhow::Result<()> {
         .route("/bulk-tests/{run_id}", get(routes::bulk_test::get_bulk_test))
         .route("/bulk-tests/{run_id}/optimize", post(routes::optimize::optimize_weights))
         .route("/bulk-tests/{run_id}/apply-weights", post(routes::optimize::apply_weights))
+        .route("/classify", post(routes::classify::classify_single))
+        .route("/classify/methods", get(routes::classify::list_methods))
+        .route("/classify/compare", post(routes::classify::start_compare))
+        .route("/classify/compare/{run_id}", get(routes::classify::get_compare_results))
+        .route("/classify/compare-runs", get(routes::classify::list_compare_runs))
         .layer(CorsLayer::permissive())
         .with_state(state);
 

@@ -152,6 +152,7 @@ pub async fn get_run_agent_id(db: &SqlitePool, run_id: i64) -> anyhow::Result<i6
 // ---------------------------------------------------------------------------
 
 use inference::VCmessage;
+use inference_types;
 use sqlx::PgPool;
 
 /// Raw row returned from the marketing `vcmessages` table.
@@ -162,22 +163,37 @@ struct VcMessageRow {
     textcontent: Option<String>,
 }
 
-/// List all agent IDs that have at least one valid VC message.
-pub async fn list_agent_ids(vc_db: &PgPool) -> anyhow::Result<Vec<i32>> {
-    let ids = sqlx::query_scalar::<_, i32>(
-        r#"SELECT DISTINCT agentid
-           FROM vcmessages
-           WHERE textcontent IS NOT NULL
-             AND categoryname IS NOT NULL
-             AND categoryname != 'conversation_flow'
-             AND textcontent NOT LIKE '%{{conversation_flow}}%'
-             AND textcontent != 'N/A'
-           ORDER BY agentid"#,
+/// List all agents that have at least one valid VC message.
+pub async fn list_agents(vc_db: &PgPool) -> anyhow::Result<Vec<inference_types::AgentInfo>> {
+    #[derive(sqlx::FromRow)]
+    struct Row {
+        agentid: i32,
+        agentname: Option<String>,
+    }
+
+    let rows = sqlx::query_as::<_, Row>(
+        r#"SELECT DISTINCT v.agentid, a.agentname
+           FROM vcmessages v
+           JOIN vcembeddingmessages em ON em.messageid = v.id
+           LEFT JOIN vcagents a ON a.id = v.agentid
+           WHERE v.textcontent IS NOT NULL
+             AND v.categoryname IS NOT NULL
+             AND v.categoryname != 'conversation_flow'
+             AND v.textcontent NOT LIKE '%{{conversation_flow}}%'
+             AND v.textcontent != 'N/A'
+           ORDER BY v.agentid"#,
     )
     .fetch_all(vc_db)
     .await
-    .context("failed to list agent IDs from marketing DB")?;
-    Ok(ids)
+    .with_context(|| "failed to list agents — check VCagents/VCmessages/VCembeddingmessages join")?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| inference_types::AgentInfo {
+            name: r.agentname.unwrap_or_else(|| format!("Agent {}", r.agentid)),
+            id: r.agentid,
+        })
+        .collect())
 }
 
 /// Load approved VC messages for a given agent from the marketing Postgres DB.
@@ -187,19 +203,20 @@ pub async fn load_vc_messages(
     agent_id: i32,
 ) -> anyhow::Result<Vec<VCmessage>> {
     let rows = sqlx::query_as::<_, VcMessageRow>(
-        r#"SELECT categoryname, categorydescription, textcontent
-           FROM vcmessages
-           WHERE agentid    = $1
-             AND textcontent   IS NOT NULL
-             AND categoryname  IS NOT NULL
-             AND categoryname  != 'conversation_flow'
-             AND textcontent NOT LIKE '%{{conversation_flow}}%'
-             AND textcontent   != 'N/A'"#,
+        r#"SELECT v.categoryname, v.categorydescription, v.textcontent
+           FROM vcmessages v
+           JOIN vcembeddingmessages em ON em.messageid = v.id
+           WHERE v.agentid      = $1
+             AND v.textcontent  IS NOT NULL
+             AND v.categoryname IS NOT NULL
+             AND v.categoryname != 'conversation_flow'
+             AND v.textcontent NOT LIKE '%{{conversation_flow}}%'
+             AND v.textcontent  != 'N/A'"#,
     )
     .bind(agent_id)
     .fetch_all(vc_db)
     .await
-    .context("failed to load vcmessages from marketing DB")?;
+    .with_context(|| format!("failed to load vcmessages for agent {agent_id}"))?;
 
     let messages: Vec<VCmessage> = rows
         .into_iter()
@@ -332,19 +349,20 @@ pub async fn load_vc_messages_with_ids(
     }
 
     let rows = sqlx::query_as::<_, Row>(
-        r#"SELECT id, categoryname, categorydescription, textcontent
-           FROM vcmessages
-           WHERE agentid    = $1
-             AND textcontent   IS NOT NULL
-             AND categoryname  IS NOT NULL
-             AND categoryname  != 'conversation_flow'
-             AND textcontent NOT LIKE '%{{conversation_flow}}%'
-             AND textcontent   != 'N/A'"#,
+        r#"SELECT v.id, v.categoryname, v.categorydescription, v.textcontent
+           FROM vcmessages v
+           JOIN vcembeddingmessages em ON em.messageid = v.id
+           WHERE v.agentid      = $1
+             AND v.textcontent  IS NOT NULL
+             AND v.categoryname IS NOT NULL
+             AND v.categoryname != 'conversation_flow'
+             AND v.textcontent NOT LIKE '%{{conversation_flow}}%'
+             AND v.textcontent  != 'N/A'"#,
     )
     .bind(agent_id)
     .fetch_all(vc_db)
     .await
-    .context("failed to load vcmessages with IDs from marketing DB")?;
+    .with_context(|| format!("failed to load vcmessages with IDs for agent {agent_id}"))?;
 
     let messages = rows
         .into_iter()
@@ -404,13 +422,14 @@ pub async fn insert_bulk_test_result(
     correct_categories_json: &str,
     success: bool,
     steps_json: &str,
+    classifier_results_json: &str,
 ) -> anyhow::Result<()> {
     let eid = example_id as i64;
     let ok = success as i64;
     sqlx::query!(
         "INSERT INTO bulk_test_results \
-         (run_id, example_id, example_text, chosen_category, correct_categories, success, steps) \
-         VALUES (?, ?, ?, ?, ?, ?, ?)",
+         (run_id, example_id, example_text, chosen_category, correct_categories, success, steps, classifier_results) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         run_id,
         eid,
         example_text,
@@ -418,6 +437,7 @@ pub async fn insert_bulk_test_result(
         correct_categories_json,
         ok,
         steps_json,
+        classifier_results_json,
     )
     .execute(db)
     .await
@@ -487,6 +507,7 @@ pub struct StoredBulkTestResult {
     pub correct_categories_json: String,
     pub success: bool,
     pub steps_json: String,
+    pub classifier_results_json: String,
 }
 
 /// Load all results for a given run, ordered by insertion.
@@ -495,7 +516,7 @@ pub async fn load_bulk_test_results(
     run_id: i64,
 ) -> anyhow::Result<Vec<StoredBulkTestResult>> {
     let rows = sqlx::query!(
-        "SELECT example_id, example_text, chosen_category, correct_categories, success, steps \
+        "SELECT example_id, example_text, chosen_category, correct_categories, success, steps, classifier_results \
          FROM bulk_test_results WHERE run_id = ? ORDER BY id",
         run_id,
     )
@@ -512,6 +533,7 @@ pub async fn load_bulk_test_results(
             correct_categories_json: r.correct_categories,
             success: r.success != 0,
             steps_json: r.steps,
+            classifier_results_json: r.classifier_results,
         })
         .collect())
 }
@@ -594,4 +616,130 @@ pub async fn compute_embedding_margins(
         .collect();
 
     Ok(margins)
+}
+
+// ---------------------------------------------------------------------------
+// Classifier comparison — SQLite
+// ---------------------------------------------------------------------------
+
+/// Create a new comparison run row and return its SQLite row ID.
+pub async fn create_comparison_run(
+    db: &SqlitePool,
+    agent_id: i64,
+    methods_json: &str,
+) -> anyhow::Result<i64> {
+    let result = sqlx::query!(
+        "INSERT INTO classifier_comparison_runs (agent_id, methods) VALUES (?, ?)",
+        agent_id,
+        methods_json,
+    )
+    .execute(db)
+    .await
+    .context("failed to insert classifier_comparison_run")?;
+    Ok(result.last_insert_rowid())
+}
+
+/// Persist one comparison result.
+pub async fn insert_comparison_result(
+    db: &SqlitePool,
+    run_id: i64,
+    example_id: i64,
+    example_text: &str,
+    correct_categories_json: &str,
+    results_json: &str,
+) -> anyhow::Result<()> {
+    sqlx::query!(
+        "INSERT INTO classifier_comparison_results \
+         (run_id, example_id, example_text, correct_categories, results) \
+         VALUES (?, ?, ?, ?, ?)",
+        run_id,
+        example_id,
+        example_text,
+        correct_categories_json,
+        results_json,
+    )
+    .execute(db)
+    .await
+    .context("failed to insert classifier_comparison_result")?;
+    Ok(())
+}
+
+/// Mark a comparison run as finished.
+pub async fn complete_comparison_run(
+    db: &SqlitePool,
+    run_id: i64,
+    total: i64,
+    summary_json: &str,
+) -> anyhow::Result<()> {
+    sqlx::query!(
+        "UPDATE classifier_comparison_runs \
+         SET completed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), \
+             total = ?, summary = ? \
+         WHERE id = ?",
+        total,
+        summary_json,
+        run_id,
+    )
+    .execute(db)
+    .await
+    .context("failed to complete classifier_comparison_run")?;
+    Ok(())
+}
+
+pub struct StoredComparisonResult {
+    pub example_id: i64,
+    pub example_text: String,
+    pub correct_categories_json: String,
+    pub results_json: String,
+}
+
+/// Load all results for a given comparison run.
+pub async fn load_comparison_results(
+    db: &SqlitePool,
+    run_id: i64,
+) -> anyhow::Result<Vec<StoredComparisonResult>> {
+    let rows = sqlx::query!(
+        "SELECT example_id, example_text, correct_categories, results \
+         FROM classifier_comparison_results WHERE run_id = ? ORDER BY id",
+        run_id,
+    )
+    .fetch_all(db)
+    .await
+    .context("failed to load classifier_comparison_results")?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| StoredComparisonResult {
+            example_id: r.example_id,
+            example_text: r.example_text,
+            correct_categories_json: r.correct_categories,
+            results_json: r.results,
+        })
+        .collect())
+}
+
+/// List the 50 most recent comparison runs.
+pub async fn list_comparison_runs(
+    db: &SqlitePool,
+) -> anyhow::Result<Vec<crate::routes::classify::CompareRunSummary>> {
+    let rows = sqlx::query!(
+        "SELECT id, agent_id, methods, started_at, completed_at, total, summary \
+         FROM classifier_comparison_runs ORDER BY started_at DESC LIMIT 50"
+    )
+    .fetch_all(db)
+    .await
+    .context("failed to list classifier_comparison_runs")?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| crate::routes::classify::CompareRunSummary {
+            id: r.id,
+            agent_id: r.agent_id,
+            methods: r.methods,
+            started_at: r.started_at,
+            completed_at: r.completed_at,
+            total: r.total,
+            summary: r.summary,
+        })
+        .collect())
 }

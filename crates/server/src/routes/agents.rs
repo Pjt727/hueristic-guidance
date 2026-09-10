@@ -4,19 +4,20 @@ use axum::{
     http::StatusCode,
 };
 use inference::GrammarFlow;
+use inference_types::AgentInfo;
 
 use crate::db;
 use crate::state::AppState;
 
 /// GET /agents
 ///
-/// Returns the sorted list of agent IDs that have at least one valid VC message.
-pub async fn list_agents(State(state): State<AppState>) -> Result<Json<Vec<i32>>, StatusCode> {
-    let ids = db::list_agent_ids(&state.vc_db).await.map_err(|e| {
-        tracing::error!(error = %e, "failed to list agent IDs");
+/// Returns agents (id + name) that have at least one valid VC message.
+pub async fn list_agents(State(state): State<AppState>) -> Result<Json<Vec<AgentInfo>>, StatusCode> {
+    let agents = db::list_agents(&state.vc_db).await.map_err(|e| {
+        tracing::error!("failed to list agents: {e:#}");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
-    Ok(Json(ids))
+    Ok(Json(agents))
 }
 
 /// GET /agents/:agent_id/system-prompt

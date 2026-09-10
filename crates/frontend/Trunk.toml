@@ -21,3 +21,11 @@ rewrite = "/bulk-test"
 [[proxy]]
 backend = "http://localhost:3000/bulk-tests"
 rewrite = "/bulk-tests"
+
+[[proxy]]
+backend = "http://localhost:3000/classify"
+rewrite = "/classify"
+
+[[proxy]]
+backend = "http://localhost:3000/classify/methods"
+rewrite = "/classify/methods"

@@ -214,6 +214,98 @@ pub fn optimize_weights(examples: &[ExampleData]) -> Option<HashMap<String, f64>
     Some(result)
 }
 
+/// Compute classification accuracy for a set of examples using given kappa values.
+/// Returns (correct_count, total, per_category_accuracy).
+pub fn eval_accuracy(
+    examples: &[ExampleData],
+    kappa_map: &HashMap<String, f64>,
+) -> AccuracyReport {
+    let mut correct = 0usize;
+    let mut total = 0usize;
+    let mut per_category_correct: HashMap<String, usize> = HashMap::new();
+    let mut per_category_total: HashMap<String, usize> = HashMap::new();
+
+    for ex in examples {
+        if ex.correct_categories.is_empty() {
+            continue;
+        }
+        total += 1;
+
+        // Compute score for each category: logit + kappa * sim_score
+        let mut best_cat: Option<(String, f64)> = None;
+        for (name, cs) in &ex.category_scores {
+            let k = kappa_map.get(name).copied().unwrap_or(0.0);
+            let score = cs.logit as f64 + k * cs.sim_score as f64;
+            if best_cat.as_ref().map_or(true, |(_, s)| score > *s) {
+                best_cat = Some((name.clone(), score));
+            }
+        }
+
+        let is_correct = best_cat
+            .as_ref()
+            .map(|(name, _)| ex.correct_categories.contains(name))
+            .unwrap_or(false);
+
+        if is_correct {
+            correct += 1;
+        }
+
+        // Track per-category stats (by correct category)
+        for cc in &ex.correct_categories {
+            *per_category_total.entry(cc.clone()).or_default() += 1;
+            if is_correct {
+                *per_category_correct.entry(cc.clone()).or_default() += 1;
+            }
+        }
+    }
+
+    let per_category: HashMap<String, CategoryAccuracy> = per_category_total
+        .into_iter()
+        .map(|(name, cat_total)| {
+            let cat_correct = per_category_correct.get(&name).copied().unwrap_or(0);
+            (
+                name,
+                CategoryAccuracy {
+                    correct: cat_correct,
+                    total: cat_total,
+                    accuracy_pct: if cat_total > 0 {
+                        cat_correct as f64 / cat_total as f64 * 100.0
+                    } else {
+                        0.0
+                    },
+                },
+            )
+        })
+        .collect();
+
+    AccuracyReport {
+        correct,
+        total,
+        accuracy_pct: if total > 0 {
+            correct as f64 / total as f64 * 100.0
+        } else {
+            0.0
+        },
+        per_category,
+    }
+}
+
+/// Accuracy report for a kappa configuration.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AccuracyReport {
+    pub correct: usize,
+    pub total: usize,
+    pub accuracy_pct: f64,
+    pub per_category: HashMap<String, CategoryAccuracy>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CategoryAccuracy {
+    pub correct: usize,
+    pub total: usize,
+    pub accuracy_pct: f64,
+}
+
 // ---------------------------------------------------------------------------
 // Unit tests
 // ---------------------------------------------------------------------------

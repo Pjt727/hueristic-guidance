@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::sync::Arc;
 
 use axum::{
     Json,
@@ -7,8 +8,9 @@ use axum::{
     http::StatusCode,
     response::sse::{Event, KeepAlive, Sse},
 };
+use classifiers::{CategoryDef, Classifier};
 use inference::{CategoryBias, GrammarFlow, InferenceEvent};
-use inference_types::{BulkTestEvent, CategoryTopToken, StepCandidates, TokenWithProb};
+use inference_types::{BulkTestEvent, CategoryTopToken, ClassifierMethodResult, ClassifierScore, StepCandidates, TokenWithProb};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt as _;
@@ -94,6 +96,42 @@ pub async fn start_bulk_test(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
+    // Build standalone classifiers for this agent's categories.
+    let categories_for_classifiers: Vec<CategoryDef> = vc_messages
+        .iter()
+        .map(|m| CategoryDef {
+            name: m.category.clone(),
+            description: m.description.clone(),
+        })
+        .collect();
+
+    let mut standalone_classifiers: Vec<Arc<dyn Classifier>> = vec![
+        Arc::new(classifiers::tfidf::TfIdfClassifier::new(&categories_for_classifiers)),
+    ];
+    if let Ok(api_key) = std::env::var("OPENAI_API_KEY") {
+        match classifiers::openai_embedding::OpenAiEmbeddingClassifier::new(
+            api_key,
+            &categories_for_classifiers,
+        )
+        .await
+        {
+            Ok(c) => {
+                let openai_clf: Arc<dyn Classifier> = Arc::new(c);
+                let ensemble = classifiers::ensemble::EnsembleClassifier::equal_weight(vec![
+                    standalone_classifiers[0].clone(),
+                    openai_clf.clone(),
+                ]);
+                standalone_classifiers.push(openai_clf);
+                standalone_classifiers.push(Arc::new(ensemble));
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "OpenAI embedding init failed for bulk test");
+            }
+        }
+    }
+    let standalone_classifiers = Arc::new(standalone_classifiers);
+    let categories_for_classifiers = Arc::new(categories_for_classifiers);
+
     // Build a map: category_name → vcmessage id.
     // The grammar output starts with "Category: {name}\n\n", so we parse the
     // category name directly from the generated text prefix instead of doing a
@@ -129,6 +167,32 @@ pub async fn start_bulk_test(
             tracing::error!(agent_id, error = %e, "failed to load correct answer map");
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
+
+    // Filter out examples that have no expected category (no entry in correct_answers).
+    let before_filter = examples.len();
+    let examples: Vec<_> = examples
+        .into_iter()
+        .filter(|e| {
+            correct_answers
+                .get(&e.id)
+                .map(|ids| !ids.is_empty())
+                .unwrap_or(false)
+        })
+        .collect();
+    if examples.len() < before_filter {
+        tracing::info!(
+            agent_id,
+            before = before_filter,
+            after = examples.len(),
+            skipped = before_filter - examples.len(),
+            "filtered out examples with no expected category"
+        );
+    }
+
+    if examples.is_empty() {
+        tracing::warn!(agent_id, "no HCP examples with expected categories — nothing to test");
+        return Err(StatusCode::BAD_REQUEST);
+    }
 
     // Generate embeddings for all examples in batches of EMBEDDING_BATCH_SIZE.
     let example_embeddings: Vec<Vec<f32>> = match std::env::var("OPENAI_API_KEY") {
@@ -174,11 +238,15 @@ pub async fn start_bulk_test(
     let vc_db = state.vc_db.clone();
     let sqlite_db = state.db.clone();
     let total = examples.len();
+    let standalone_classifiers_spawn = standalone_classifiers.clone();
+    let categories_for_classifiers_spawn = categories_for_classifiers.clone();
 
     // Run inference sequentially: one LlamaContext in memory at a time.
     // Each iteration loads the system-prompt KV cache from disk, processes
     // the user turn, generates, then drops the context before the next test.
     tokio::spawn(async move {
+        let standalone_classifiers = standalone_classifiers_spawn;
+        let categories_for_classifiers = categories_for_classifiers_spawn;
         for (example, embedding_vec) in examples.into_iter().zip(example_embeddings.into_iter()) {
             // Shadow to avoid moving into closure before needed.
             // Compute per-category biases using the pre-fetched embedding.
@@ -283,6 +351,39 @@ pub async fn start_bulk_test(
                 })
                 .unwrap_or_default();
 
+            // Run standalone classifiers on the example text.
+            let mut classifier_results_vec: Vec<ClassifierMethodResult> = vec![];
+            for clf in standalone_classifiers.iter() {
+                match clf.classify(&example.text, &categories_for_classifiers, None).await {
+                    Ok(result) => {
+                        classifier_results_vec.push(ClassifierMethodResult {
+                            method_name: result.method_name,
+                            chosen_category: result.chosen_category,
+                            confidence: result.confidence,
+                            latency_ms: result.latency_ms,
+                            scores: result
+                                .scores
+                                .into_iter()
+                                .map(|s| ClassifierScore {
+                                    category_name: s.category_name,
+                                    score: s.score,
+                                })
+                                .collect(),
+                        });
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            method = clf.name(),
+                            example_id = example.id,
+                            error = %e,
+                            "classifier failed during bulk test"
+                        );
+                    }
+                }
+            }
+            let classifier_results_json =
+                serde_json::to_string(&classifier_results_vec).unwrap_or_else(|_| "[]".to_string());
+
             // Persist to SQLite before streaming so the result is durable even
             // if the client disconnects mid-run.
             let correct_cats_json =
@@ -298,6 +399,7 @@ pub async fn start_bulk_test(
                 &correct_cats_json,
                 success,
                 &steps_json,
+                &classifier_results_json,
             )
             .await
             {
@@ -311,6 +413,7 @@ pub async fn start_bulk_test(
                 correct_categories,
                 success,
                 steps,
+                classifier_results: classifier_results_vec,
             };
             if tx.send(result).await.is_err() {
                 break; // client disconnected
@@ -449,6 +552,7 @@ pub struct StoredTestResult {
     pub correct_categories: Vec<String>,
     pub success: bool,
     pub steps: Vec<StepCandidates>,
+    pub classifier_results: Vec<inference_types::ClassifierMethodResult>,
 }
 
 /// GET /bulk-tests/{run_id}
@@ -473,6 +577,8 @@ pub async fn get_bulk_test(
                 .into_iter()
                 .map(SlimStep::into_step)
                 .collect();
+            let classifier_results: Vec<inference_types::ClassifierMethodResult> =
+                serde_json::from_str(&r.classifier_results_json).unwrap_or_default();
             Some(StoredTestResult {
                 example_id: r.example_id as i32,
                 example_text: r.example_text,
@@ -480,6 +586,7 @@ pub async fn get_bulk_test(
                 correct_categories,
                 success: r.success,
                 steps,
+                classifier_results,
             })
         })
         .collect();

@@ -20,7 +20,8 @@ web-sys         = { version = "0.3", features = [
     "CloseEvent",
 ] }
 js-sys          = "0.3"
-gloo-net        = { version = "0.6", features = ["http"] }
+gloo-net             = { version = "0.6", features = ["http"] }
+wasm-bindgen-futures = "0.4"
 
 [profile.release]
 opt-level     = "z"

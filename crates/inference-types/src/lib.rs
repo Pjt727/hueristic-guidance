@@ -1,5 +1,12 @@
 pub type TokenID = u32;
 
+/// An agent entry returned by GET /agents.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct AgentInfo {
+    pub id: i32,
+    pub name: String,
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TokenWithProb {
     pub text: String,
@@ -51,6 +58,21 @@ pub enum InferenceEvent {
     Error { message: String },
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ClassifierScore {
+    pub category_name: String,
+    pub score: f64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ClassifierMethodResult {
+    pub method_name: String,
+    pub chosen_category: String,
+    pub confidence: f64,
+    pub latency_ms: u64,
+    pub scores: Vec<ClassifierScore>,
+}
+
 /// A single test case result streamed during a bulk test run.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -65,6 +87,8 @@ pub enum BulkTestEvent {
         correct_categories: Vec<String>,
         success: bool,
         steps: Vec<StepCandidates>,
+        #[serde(default)]
+        classifier_results: Vec<ClassifierMethodResult>,
     },
     /// All test cases have finished.
     Done { total: usize, success_count: usize },

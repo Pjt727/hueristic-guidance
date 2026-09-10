@@ -3,8 +3,8 @@ use leptos::prelude::*;
 use wasm_bindgen::{JsCast, closure::Closure};
 use web_sys::{EventSource, MessageEvent};
 
-/// GET /agents — returns the list of agent IDs that have VC messages.
-pub async fn fetch_agents() -> Result<Vec<i32>, String> {
+/// GET /agents — returns the list of agents (id + name) that have VC messages.
+pub async fn fetch_agents() -> Result<Vec<inference_types::AgentInfo>, String> {
     let resp = gloo_net::http::Request::get("/agents")
         .send()
         .await
@@ -14,7 +14,9 @@ pub async fn fetch_agents() -> Result<Vec<i32>, String> {
         return Err(format!("HTTP {}", resp.status()));
     }
 
-    resp.json::<Vec<i32>>().await.map_err(|e| e.to_string())
+    resp.json::<Vec<inference_types::AgentInfo>>()
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// GET /agents/:agent_id/system-prompt — returns the rendered system prompt text.
@@ -152,6 +154,8 @@ pub async fn fetch_bulk_test_run(run_id: i64) -> Result<Vec<TestResult>, String>
         correct_categories: Vec<String>,
         success: bool,
         steps: Vec<inference_types::StepCandidates>,
+        #[serde(default)]
+        classifier_results: Vec<inference_types::ClassifierMethodResult>,
     }
     let rows = resp.json::<Vec<Row>>().await.map_err(|e| e.to_string())?;
     Ok(rows
@@ -163,6 +167,7 @@ pub async fn fetch_bulk_test_run(run_id: i64) -> Result<Vec<TestResult>, String>
             correct_categories: r.correct_categories,
             success: r.success,
             steps: r.steps,
+            classifier_results: r.classifier_results,
         })
         .collect())
 }
@@ -203,6 +208,7 @@ pub struct TestResult {
     pub correct_categories: Vec<String>,
     pub success: bool,
     pub steps: Vec<StepCandidates>,
+    pub classifier_results: Vec<inference_types::ClassifierMethodResult>,
 }
 
 /// POST /bulk-tests/{run_id}/apply-weights — saves per-category kappa values to the DB.
@@ -249,6 +255,83 @@ pub struct OptimizeResponse {
     pub weights: std::collections::HashMap<String, f64>,
     pub examples_used: usize,
     pub examples_skipped: usize,
+    /// Server-computed accuracy with default kappa=10.0.
+    #[serde(default)]
+    pub baseline_accuracy: Option<AccuracyReport>,
+    /// Server-computed accuracy with kappa=0 (no embedding bias).
+    #[serde(default)]
+    pub no_embedding_accuracy: Option<AccuracyReport>,
+    /// Server-computed accuracy with the optimised kappa values.
+    #[serde(default)]
+    pub optimized_accuracy: Option<AccuracyReport>,
+    /// Classifier ensemble optimization results.
+    #[serde(default)]
+    pub ensemble_optimization: Option<EnsembleOptimization>,
+}
+
+/// Accuracy report from the server-side kappa evaluation.
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct AccuracyReport {
+    pub correct: usize,
+    pub total: usize,
+    pub accuracy_pct: f64,
+    #[serde(default)]
+    pub per_category: std::collections::HashMap<String, CategoryAccuracyInfo>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct CategoryAccuracyInfo {
+    pub correct: usize,
+    pub total: usize,
+    pub accuracy_pct: f64,
+}
+
+/// Classifier ensemble optimization results (TF-IDF vs embedding weights + LLM analysis).
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct EnsembleOptimization {
+    pub examples_analyzed: usize,
+    pub baseline_accuracy: std::collections::HashMap<String, f64>,
+    pub weight_search: Vec<WeightPoint>,
+    pub optimal_weights: WeightPoint,
+    pub temperature_search: Vec<TemperaturePoint>,
+    pub optimal_temperature: TemperaturePoint,
+    pub llm_accuracy_pct: Option<f64>,
+    pub llm_category_stats: std::collections::HashMap<String, LlmCategoryStats>,
+    pub category_bias_offsets: Vec<CategoryBiasOffset>,
+    pub bias_corrected_accuracy_pct: Option<f64>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct WeightPoint {
+    pub tfidf_weight: f64,
+    pub embedding_weight: f64,
+    pub correct: usize,
+    pub total: usize,
+    pub accuracy_pct: f64,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct TemperaturePoint {
+    pub temperature: f64,
+    pub correct: usize,
+    pub total: usize,
+    pub accuracy_pct: f64,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct LlmCategoryStats {
+    pub avg_logit: f64,
+    pub avg_probability: f64,
+    pub times_chosen: usize,
+    pub times_correct: usize,
+    pub sample_count: usize,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct CategoryBiasOffset {
+    pub category_name: String,
+    pub bias_offset: f64,
+    pub sample_count: usize,
 }
 
 /// Opens an SSE connection to GET /bulk-test/stream/:bulk_test_id.
@@ -282,6 +365,7 @@ pub fn open_bulk_test_stream(
                 correct_categories,
                 success,
                 steps,
+                classifier_results,
             }) => {
                 set_results.update(|v| {
                     v.push(TestResult {
@@ -291,6 +375,7 @@ pub fn open_bulk_test_stream(
                         correct_categories,
                         success,
                         steps,
+                        classifier_results,
                     })
                 });
             }
@@ -332,3 +417,61 @@ pub fn open_bulk_test_stream(
 
     std::mem::forget(es);
 }
+
+// ---------------------------------------------------------------------------
+// Classifier API
+// ---------------------------------------------------------------------------
+
+/// GET /classify/methods — list classifier method names available on the server.
+pub async fn fetch_classifier_methods() -> Result<Vec<String>, String> {
+    let resp = gloo_net::http::Request::get("/classify/methods")
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if !resp.ok() {
+        return Err(format!("HTTP {}", resp.status()));
+    }
+    resp.json::<Vec<String>>().await.map_err(|e| e.to_string())
+}
+
+/// POST /classify — classify a single query with all available methods.
+pub async fn classify_single(
+    prompt: &str,
+    agent_id: i32,
+) -> Result<Vec<inference_types::ClassifierMethodResult>, String> {
+    #[derive(serde::Deserialize)]
+    struct ClassificationResultRaw {
+        method_name: String,
+        chosen_category: String,
+        confidence: f64,
+        latency_ms: u64,
+        scores: Vec<inference_types::ClassifierScore>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Resp {
+        results: Vec<ClassificationResultRaw>,
+    }
+    let body = serde_json::json!({ "prompt": prompt, "agent_id": agent_id });
+    let resp = gloo_net::http::Request::post("/classify")
+        .header("Content-Type", "application/json")
+        .body(body.to_string())
+        .map_err(|e| e.to_string())?
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if !resp.ok() {
+        return Err(format!("HTTP {}", resp.status()));
+    }
+    let r: Resp = resp.json().await.map_err(|e| e.to_string())?;
+    Ok(r.results
+        .into_iter()
+        .map(|x| inference_types::ClassifierMethodResult {
+            method_name: x.method_name,
+            chosen_category: x.chosen_category,
+            confidence: x.confidence,
+            latency_ms: x.latency_ms,
+            scores: x.scores,
+        })
+        .collect())
+}
+

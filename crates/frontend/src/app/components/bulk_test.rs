@@ -361,25 +361,43 @@ pub fn BulkTestPage() -> impl IntoView {
                                 let resp = optimize_result.get()?;
                                 let weights_for_apply = resp.weights.clone();
 
-                                // Simulated accuracy with optimised kappas.
-                                let rs = results.get();
-                                let (sim_correct, sim_total) =
-                                    simulate_accuracy(&rs, &resp.weights, 10.0);
-                                // Baseline: logit-only (kappa = 0 for all).
-                                let empty: HashMap<String, f64> = HashMap::new();
-                                let (logit_correct, logit_total) =
-                                    simulate_accuracy(&rs, &empty, 0.0);
-                                // Baseline: original kappa = 10.
-                                let (k10_correct, k10_total) =
-                                    simulate_accuracy(&rs, &empty, 10.0);
-
                                 let fmt_acc = |c: usize, t: usize| -> String {
                                     if t == 0 { "—".into() }
                                     else { format!("{c}/{t} ({:.0}%)", c as f64 / t as f64 * 100.0) }
                                 };
+                                let fmt_pct = |p: f64| -> String { format!("{p:.1}%") };
+
+                                // Use server-computed accuracy if available, fallback to client sim.
+                                let (logit_correct, logit_total) = resp.no_embedding_accuracy
+                                    .as_ref()
+                                    .map(|a| (a.correct, a.total))
+                                    .unwrap_or_else(|| {
+                                        let rs = results.get();
+                                        let empty: HashMap<String, f64> = HashMap::new();
+                                        simulate_accuracy(&rs, &empty, 0.0)
+                                    });
+                                let (k10_correct, k10_total) = resp.baseline_accuracy
+                                    .as_ref()
+                                    .map(|a| (a.correct, a.total))
+                                    .unwrap_or_else(|| {
+                                        let rs = results.get();
+                                        let empty: HashMap<String, f64> = HashMap::new();
+                                        simulate_accuracy(&rs, &empty, 10.0)
+                                    });
+                                let (sim_correct, sim_total) = resp.optimized_accuracy
+                                    .as_ref()
+                                    .map(|a| (a.correct, a.total))
+                                    .unwrap_or_else(|| {
+                                        let rs = results.get();
+                                        simulate_accuracy(&rs, &resp.weights, 10.0)
+                                    });
 
                                 let mut entries: Vec<(String, f64)> = resp.weights.clone().into_iter().collect();
                                 entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+
+                                // Ensemble optimization data.
+                                let ensemble_opt = resp.ensemble_optimization.clone();
+
                                 Some(view! {
                                     <div style="margin-top:0.75rem;">
                                         <p style="font-size:0.82rem; color:#aaa; margin:0 0 0.5rem;">
@@ -389,7 +407,8 @@ pub fn BulkTestPage() -> impl IntoView {
                                                 resp.examples_used, resp.examples_skipped)}
                                         </p>
 
-                                        // Accuracy comparison table
+                                        // ── Kappa accuracy comparison ──────────────────
+                                        <h4 style="font-size:0.85rem; margin:0.5rem 0 0.3rem; color:#ccc;">"Kappa Optimisation (LLM + Embedding Bias)"</h4>
                                         <table style="border-collapse:collapse; font-size:0.82rem; margin-bottom:0.75rem;">
                                             <thead>
                                                 <tr style="background:#1e1e1e;">
@@ -411,7 +430,7 @@ pub fn BulkTestPage() -> impl IntoView {
                                                     </td>
                                                 </tr>
                                                 <tr>
-                                                    <td style="padding:3px 12px; font-weight:bold;">"Optimised kappas (estimated)"</td>
+                                                    <td style="padding:3px 12px; font-weight:bold;">"Optimised kappas"</td>
                                                     <td style=format!(
                                                         "padding:3px 12px; text-align:right; font-family:monospace; \
                                                          font-weight:bold; color:{};",
@@ -422,6 +441,8 @@ pub fn BulkTestPage() -> impl IntoView {
                                                 </tr>
                                             </tbody>
                                         </table>
+
+                                        // ── Per-category kappa table ──────────────────
                                         <table style="border-collapse:collapse; font-size:0.85rem; min-width:340px;">
                                             <thead>
                                                 <tr style="background:#1e1e1e;">
@@ -452,6 +473,8 @@ pub fn BulkTestPage() -> impl IntoView {
                                                 }).collect_view()}
                                             </tbody>
                                         </table>
+
+                                        // ── Apply button ──────────────────────────────
                                         <div style="margin-top:0.75rem; display:flex; align-items:center; gap:0.75rem;">
                                             <button
                                                 disabled=move || apply_running.get()
@@ -491,6 +514,236 @@ pub fn BulkTestPage() -> impl IntoView {
                                                 </span>
                                             </Show>
                                         </div>
+
+                                        // ── Ensemble & LLM Analysis ───────────────────
+                                        {match ensemble_opt {
+                                            None => None,
+                                            Some(eo) => {
+                                                let ow = eo.optimal_weights.clone();
+                                                let ot = eo.optimal_temperature.clone();
+                                                let llm_pct = eo.llm_accuracy_pct;
+                                                let bias_pct = eo.bias_corrected_accuracy_pct;
+
+                                                // Build weight search rows (select interesting points).
+                                                let weight_rows: Vec<_> = eo.weight_search.iter()
+                                                    .filter(|wp| {
+                                                        let w = (wp.tfidf_weight * 20.0).round();
+                                                        w == w.floor() // every 5% step
+                                                    })
+                                                    .cloned()
+                                                    .collect();
+
+                                                // Category bias offsets.
+                                                let bias_offsets = eo.category_bias_offsets.clone();
+
+                                                // LLM category stats.
+                                                let mut llm_stats: Vec<_> = eo.llm_category_stats.into_iter().collect();
+                                                llm_stats.sort_by(|(a, _), (b, _)| a.cmp(b));
+
+                                                // Baseline accuracies.
+                                                let baseline = eo.baseline_accuracy.clone();
+
+                                                Some(view! {
+                                                    <div style="margin-top:1.5rem; border-top:1px solid #333; padding-top:1rem;">
+                                                        <h4 style="font-size:0.85rem; margin:0 0 0.5rem; color:#ccc;">
+                                                            "Classifier Ensemble Analysis"
+                                                        </h4>
+
+                                                        // ── Standalone method accuracy ─────
+                                                        <table style="border-collapse:collapse; font-size:0.82rem; margin-bottom:0.75rem;">
+                                                            <thead>
+                                                                <tr style="background:#1e1e1e;">
+                                                                    <th style="text-align:left; padding:3px 12px">"Method"</th>
+                                                                    <th style="text-align:right; padding:3px 12px">"Accuracy"</th>
+                                                                </tr>
+                                                            </thead>
+                                                            <tbody>
+                                                                {baseline.into_iter().map(|(method, acc)| {
+                                                                    view! {
+                                                                        <tr style="border-bottom:1px solid #2a2a2a;">
+                                                                            <td style="padding:3px 12px; color:#aaa;">{method}</td>
+                                                                            <td style="padding:3px 12px; text-align:right; font-family:monospace;">
+                                                                                {fmt_pct(acc)}
+                                                                            </td>
+                                                                        </tr>
+                                                                    }
+                                                                }).collect_view()}
+                                                                {llm_pct.map(|p| view! {
+                                                                    <tr style="border-bottom:1px solid #2a2a2a;">
+                                                                        <td style="padding:3px 12px; color:#aaa;">"LLM (1st step logits)"</td>
+                                                                        <td style="padding:3px 12px; text-align:right; font-family:monospace;">
+                                                                            {fmt_pct(p)}
+                                                                        </td>
+                                                                    </tr>
+                                                                })}
+                                                                <tr style="border-bottom:1px solid #2a2a2a;">
+                                                                    <td style="padding:3px 12px; font-weight:bold;">
+                                                                        {format!("Best ensemble (TF-IDF {:.0}% / Embed {:.0}%)",
+                                                                            ow.tfidf_weight * 100.0, ow.embedding_weight * 100.0)}
+                                                                    </td>
+                                                                    <td style="padding:3px 12px; text-align:right; font-family:monospace; font-weight:bold; color:#4caf50;">
+                                                                        {fmt_pct(ow.accuracy_pct)}
+                                                                    </td>
+                                                                </tr>
+                                                                {bias_pct.map(|p| view! {
+                                                                    <tr>
+                                                                        <td style="padding:3px 12px; color:#aaa;">
+                                                                            "Embed + LLM bias offsets"
+                                                                        </td>
+                                                                        <td style="padding:3px 12px; text-align:right; font-family:monospace;">
+                                                                            {fmt_pct(p)}
+                                                                        </td>
+                                                                    </tr>
+                                                                })}
+                                                            </tbody>
+                                                        </table>
+
+                                                        // ── Weight search grid ─────────────
+                                                        <details style="margin-bottom:0.75rem;">
+                                                            <summary style="font-size:0.82rem; color:#aaa; cursor:pointer;">
+                                                                "Weight search grid (TF-IDF vs Embedding)"
+                                                            </summary>
+                                                            <table style="border-collapse:collapse; font-size:0.78rem; margin-top:0.3rem;">
+                                                                <thead>
+                                                                    <tr style="background:#1e1e1e;">
+                                                                        <th style="text-align:right; padding:2px 8px">"TF-IDF %"</th>
+                                                                        <th style="text-align:right; padding:2px 8px">"Embed %"</th>
+                                                                        <th style="text-align:right; padding:2px 8px">"Accuracy"</th>
+                                                                    </tr>
+                                                                </thead>
+                                                                <tbody>
+                                                                    {weight_rows.into_iter().map(|wp| {
+                                                                        let is_best = (wp.tfidf_weight - ow.tfidf_weight).abs() < 0.01;
+                                                                        let style = if is_best {
+                                                                            "border-bottom:1px solid #2a2a2a; background:#1a2e1a;"
+                                                                        } else {
+                                                                            "border-bottom:1px solid #2a2a2a;"
+                                                                        };
+                                                                        view! {
+                                                                            <tr style=style>
+                                                                                <td style="padding:2px 8px; text-align:right; font-family:monospace;">
+                                                                                    {format!("{:.0}", wp.tfidf_weight * 100.0)}
+                                                                                </td>
+                                                                                <td style="padding:2px 8px; text-align:right; font-family:monospace;">
+                                                                                    {format!("{:.0}", wp.embedding_weight * 100.0)}
+                                                                                </td>
+                                                                                <td style="padding:2px 8px; text-align:right; font-family:monospace;">
+                                                                                    {fmt_pct(wp.accuracy_pct)}
+                                                                                </td>
+                                                                            </tr>
+                                                                        }
+                                                                    }).collect_view()}
+                                                                </tbody>
+                                                            </table>
+                                                        </details>
+
+                                                        // ── Temperature search ─────────────
+                                                        <details style="margin-bottom:0.75rem;">
+                                                            <summary style="font-size:0.82rem; color:#aaa; cursor:pointer;">
+                                                                {format!("Temperature scaling (best T={:.4}, acc={:.1}%)",
+                                                                    ot.temperature, ot.accuracy_pct)}
+                                                            </summary>
+                                                            <p style="font-size:0.78rem; color:#666; margin:0.2rem 0;">
+                                                                "Tests softmax(embed_scores / T) combined with TF-IDF in a 50/50 ensemble. \
+                                                                 Lower T amplifies small embedding differences."
+                                                            </p>
+                                                        </details>
+
+                                                        // ── LLM-derived bias offsets ───────
+                                                        {if !bias_offsets.is_empty() {
+                                                            Some(view! {
+                                                                <details style="margin-bottom:0.75rem;">
+                                                                    <summary style="font-size:0.82rem; color:#aaa; cursor:pointer;">
+                                                                        "LLM-derived category bias offsets"
+                                                                    </summary>
+                                                                    <p style="font-size:0.78rem; color:#666; margin:0.2rem 0 0.3rem;">
+                                                                        "Residual between avg LLM softmax probability and avg embedding score. \
+                                                                         Positive = LLM favours this category more than embeddings do."
+                                                                    </p>
+                                                                    <table style="border-collapse:collapse; font-size:0.78rem;">
+                                                                        <thead>
+                                                                            <tr style="background:#1e1e1e;">
+                                                                                <th style="text-align:left; padding:2px 8px">"Category"</th>
+                                                                                <th style="text-align:right; padding:2px 8px">"Bias offset"</th>
+                                                                                <th style="text-align:right; padding:2px 8px">"Samples"</th>
+                                                                            </tr>
+                                                                        </thead>
+                                                                        <tbody>
+                                                                            {bias_offsets.into_iter().map(|bo| {
+                                                                                let color = if bo.bias_offset > 0.01 { "#4caf50" }
+                                                                                    else if bo.bias_offset < -0.01 { "#f44336" }
+                                                                                    else { "#aaa" };
+                                                                                view! {
+                                                                                    <tr style="border-bottom:1px solid #2a2a2a;">
+                                                                                        <td style="padding:2px 8px; font-family:monospace;">
+                                                                                            {bo.category_name}
+                                                                                        </td>
+                                                                                        <td style=format!("padding:2px 8px; text-align:right; \
+                                                                                            font-family:monospace; color:{color};")>
+                                                                                            {format!("{:+.4}", bo.bias_offset)}
+                                                                                        </td>
+                                                                                        <td style="padding:2px 8px; text-align:right; font-family:monospace;">
+                                                                                            {bo.sample_count}
+                                                                                        </td>
+                                                                                    </tr>
+                                                                                }
+                                                                            }).collect_view()}
+                                                                        </tbody>
+                                                                    </table>
+                                                                </details>
+                                                            })
+                                                        } else {
+                                                            None
+                                                        }}
+
+                                                        // ── LLM category stats ────────────
+                                                        {if !llm_stats.is_empty() {
+                                                            Some(view! {
+                                                                <details>
+                                                                    <summary style="font-size:0.82rem; color:#aaa; cursor:pointer;">
+                                                                        "LLM per-category logit statistics"
+                                                                    </summary>
+                                                                    <table style="border-collapse:collapse; font-size:0.78rem; margin-top:0.3rem;">
+                                                                        <thead>
+                                                                            <tr style="background:#1e1e1e;">
+                                                                                <th style="text-align:left; padding:2px 8px">"Category"</th>
+                                                                                <th style="text-align:right; padding:2px 8px">"Avg logit"</th>
+                                                                                <th style="text-align:right; padding:2px 8px">"Avg prob"</th>
+                                                                                <th style="text-align:right; padding:2px 8px">"Chosen"</th>
+                                                                                <th style="text-align:right; padding:2px 8px">"Correct"</th>
+                                                                            </tr>
+                                                                        </thead>
+                                                                        <tbody>
+                                                                            {llm_stats.into_iter().map(|(name, st)| {
+                                                                                view! {
+                                                                                    <tr style="border-bottom:1px solid #2a2a2a;">
+                                                                                        <td style="padding:2px 8px; font-family:monospace;">{name}</td>
+                                                                                        <td style="padding:2px 8px; text-align:right; font-family:monospace;">
+                                                                                            {format!("{:.2}", st.avg_logit)}
+                                                                                        </td>
+                                                                                        <td style="padding:2px 8px; text-align:right; font-family:monospace;">
+                                                                                            {format!("{:.1}%", st.avg_probability * 100.0)}
+                                                                                        </td>
+                                                                                        <td style="padding:2px 8px; text-align:right; font-family:monospace;">
+                                                                                            {st.times_chosen}
+                                                                                        </td>
+                                                                                        <td style="padding:2px 8px; text-align:right; font-family:monospace;">
+                                                                                            {st.times_correct}
+                                                                                        </td>
+                                                                                    </tr>
+                                                                                }
+                                                                            }).collect_view()}
+                                                                        </tbody>
+                                                                    </table>
+                                                                </details>
+                                                            })
+                                                        } else {
+                                                            None
+                                                        }}
+                                                    </div>
+                                                })
+                                            }
+                                        }}
                                     </div>
                                 })
                             }}
@@ -500,60 +753,133 @@ pub fn BulkTestPage() -> impl IntoView {
 
                 // Results table
                 <Show when=move || !results.get().is_empty()>
-                    <table style="width:100%; border-collapse:collapse; margin-top:0.5rem; font-size:0.9rem;">
-                        <thead>
-                            <tr style="background:#2a2a2a;">
-                                <th style="text-align:left; padding:4px 8px">"#"</th>
-                                <th style="text-align:left; padding:4px 8px">"Example"</th>
-                                <th style="text-align:left; padding:4px 8px">"Chosen Category"</th>
-                                <th style="text-align:left; padding:4px 8px">"Expected Categories"</th>
-                                <th style="text-align:center; padding:4px 8px">"Result"</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            {move || {
-                                results.get().into_iter().enumerate().map(|(i, r)| {
-                                    let is_selected = selected_result_idx.get() == Some(i);
-                                    let bg = if is_selected { "#2d3a2d" } else { "transparent" };
-                                    let badge_color = if r.success { "#4caf50" } else { "#f44336" };
-                                    let badge = if r.success { "✓" } else { "✗" };
-                                    let preview: String = r.example_text.chars().take(80).collect();
-                                    let preview = if r.example_text.len() > 80 {
-                                        format!("{preview}…")
-                                    } else {
-                                        preview
-                                    };
-                                    let cat = r.chosen_category.clone().unwrap_or_else(|| "—".to_string());
-                                    let expected = r.correct_categories.join(", ");
-                                    let steps = r.steps.clone();
-                                    view! {
-                                        <tr
-                                            style=format!("background:{bg}; cursor:pointer; border-bottom:1px solid #333;")
-                                            on:click=move |_| {
-                                                if is_selected {
-                                                    set_selected_result_idx.set(None);
-                                                    set_expanded_steps.set(vec![]);
-                                                    set_selected_step_idx.set(None);
-                                                } else {
-                                                    set_selected_result_idx.set(Some(i));
-                                                    set_expanded_steps.set(steps.clone());
-                                                    set_selected_step_idx.set(None);
-                                                }
+                    {move || {
+                        let rs = results.get();
+                        // Collect classifier method names from the first result that has any
+                        let clf_methods: Vec<String> = rs
+                            .iter()
+                            .flat_map(|r| r.classifier_results.iter().map(|c| c.method_name.clone()))
+                            .collect::<std::collections::HashSet<_>>()
+                            .into_iter()
+                            .collect::<Vec<_>>();
+                        let mut clf_methods_sorted = clf_methods.clone();
+                        clf_methods_sorted.sort();
+
+                        let clf_methods_hdr = clf_methods_sorted.clone();
+                        let clf_methods_rows = clf_methods_sorted.clone();
+
+                        view! {
+                            <table style="width:100%; border-collapse:collapse; margin-top:0.5rem; font-size:0.9rem;">
+                                <thead>
+                                    <tr style="background:#2a2a2a;">
+                                        <th style="text-align:left; padding:4px 8px">"#"</th>
+                                        <th style="text-align:left; padding:4px 8px">"Example"</th>
+                                        <th style="text-align:left; padding:4px 8px">"LLM Category"</th>
+                                        <th style="text-align:left; padding:4px 8px">"Expected"</th>
+                                        {clf_methods_hdr.into_iter().map(|m| {
+                                            view! {
+                                                <th style="text-align:left; padding:4px 8px; font-size:0.8rem; color:#aaa;">
+                                                    {m}
+                                                </th>
                                             }
-                                        >
-                                            <td style="padding:4px 8px; font-family:monospace;">{r.example_id}</td>
-                                            <td style="padding:4px 8px; font-family:monospace;">{preview}</td>
-                                            <td style="padding:4px 8px; font-family:monospace;">{cat}</td>
-                                            <td style="padding:4px 8px; font-family:monospace; color:#aaa;">{expected}</td>
-                                            <td style=format!("padding:4px 8px; text-align:center; color:{badge_color}; font-weight:bold;")>
-                                                {badge}
-                                            </td>
-                                        </tr>
-                                    }
-                                }).collect_view()
-                            }}
-                        </tbody>
-                    </table>
+                                        }).collect_view()}
+                                        <th style="text-align:center; padding:4px 8px">"Result"</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    {rs.into_iter().enumerate().map(|(i, r)| {
+                                        let is_selected = selected_result_idx.get() == Some(i);
+                                        let badge_color = if r.success { "#4caf50" } else { "#f44336" };
+                                        let badge = if r.success { "✓" } else { "✗" };
+                                        let preview: String = r.example_text.chars().take(80).collect();
+                                        let preview = if r.example_text.len() > 80 {
+                                            format!("{preview}…")
+                                        } else {
+                                            preview
+                                        };
+                                        let llm_cat = r.chosen_category.clone().unwrap_or_else(|| "—".to_string());
+                                        let expected = r.correct_categories.join(", ");
+                                        let steps = r.steps.clone();
+
+                                        // Build a map of method → chosen_category for this row
+                                        let clf_map: std::collections::HashMap<String, String> = r
+                                            .classifier_results
+                                            .iter()
+                                            .map(|c| (c.method_name.clone(), c.chosen_category.clone()))
+                                            .collect();
+
+                                        // Determine if classifiers disagree with each other or with LLM
+                                        let all_cats: Vec<&str> = {
+                                            let mut v: Vec<&str> = r.classifier_results
+                                                .iter()
+                                                .map(|c| c.chosen_category.as_str())
+                                                .collect();
+                                            if let Some(ref c) = r.chosen_category {
+                                                v.push(c.as_str());
+                                            }
+                                            v
+                                        };
+                                        let first_cat = all_cats.first().copied().unwrap_or("");
+                                        let row_has_disagreement = all_cats.iter().any(|c| *c != first_cat);
+
+                                        let row_bg = if is_selected {
+                                            "#2d3a2d".to_string()
+                                        } else if row_has_disagreement {
+                                            "#2a2000".to_string()
+                                        } else {
+                                            "transparent".to_string()
+                                        };
+
+                                        let clf_cols: Vec<String> = clf_methods_rows.clone();
+                                        let correct_cats = r.correct_categories.clone();
+
+                                        view! {
+                                            <tr
+                                                style=format!("background:{row_bg}; cursor:pointer; border-bottom:1px solid #333;")
+                                                on:click=move |_| {
+                                                    if is_selected {
+                                                        set_selected_result_idx.set(None);
+                                                        set_expanded_steps.set(vec![]);
+                                                        set_selected_step_idx.set(None);
+                                                    } else {
+                                                        set_selected_result_idx.set(Some(i));
+                                                        set_expanded_steps.set(steps.clone());
+                                                        set_selected_step_idx.set(None);
+                                                    }
+                                                }
+                                            >
+                                                <td style="padding:4px 8px; font-family:monospace;">{r.example_id}</td>
+                                                <td style="padding:4px 8px; font-family:monospace;">{preview}</td>
+                                                <td style="padding:4px 8px; font-family:monospace;">{llm_cat}</td>
+                                                <td style="padding:4px 8px; font-family:monospace; color:#aaa;">{expected}</td>
+                                                {clf_cols.into_iter().map(|method| {
+                                                    let cat = clf_map.get(&method).cloned().unwrap_or_else(|| "—".to_string());
+                                                    let is_correct = correct_cats.contains(&cat);
+                                                    let cell_color = if cat == "—" {
+                                                        "#666"
+                                                    } else if is_correct {
+                                                        "#4caf50"
+                                                    } else {
+                                                        "#f44336"
+                                                    };
+                                                    view! {
+                                                        <td style=format!(
+                                                            "padding:4px 8px; font-family:monospace; font-size:0.8rem; color:{cell_color};"
+                                                        )>
+                                                            {cat}
+                                                        </td>
+                                                    }
+                                                }).collect_view()}
+                                                <td style=format!("padding:4px 8px; text-align:center; color:{badge_color}; font-weight:bold;")>
+                                                    {badge}
+                                                </td>
+                                            </tr>
+                                        }
+                                    }).collect_view()}
+                                </tbody>
+                            </table>
+                        }
+                    }}
                 </Show>
             </div>
         </div>

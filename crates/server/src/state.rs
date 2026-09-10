@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use classifiers::Classifier;
 use inference::InferenceEngine;
 use inference_types::{BulkTestEvent, InferenceEvent};
 use sqlx::{PgPool, SqlitePool};
@@ -24,4 +25,7 @@ pub struct AppState {
     /// In-memory map of bulk_test_id → live receiver for that bulk test stream.
     /// Removed and owned by the SSE handler when the client connects.
     pub bulk_test_sessions: Arc<Mutex<HashMap<String, mpsc::Receiver<BulkTestEvent>>>>,
+    /// Standalone classifiers (TF-IDF, OpenAI embedding, local ONNX, ensemble).
+    /// Initialized at startup based on available models/API keys.
+    pub classifiers: Vec<Arc<dyn Classifier>>,
 }
