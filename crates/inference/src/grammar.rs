@@ -1,8 +1,6 @@
 use askama::Template;
 use serde::{Deserialize, Serialize};
 
-use crate::llama_tokenizer::{END_TURN_TOKEN, ID_END_TOKEN, ID_START_TOKEN};
-
 // ---------------------------------------------------------------------------
 // Shared wire type
 // ---------------------------------------------------------------------------
@@ -98,10 +96,9 @@ impl GrammarFlow {
         })
     }
 
-    pub fn get_system_prompt(&self) -> String {
-        format!(
-            "{ID_START_TOKEN}system{ID_END_TOKEN}{}{END_TURN_TOKEN}",
-            self.system_prompt
-        )
+    /// Raw system-prompt body. Chat wrappers are applied by the engine using
+    /// the loaded model's chat format (Llama-3 or ChatML).
+    pub fn get_system_prompt(&self) -> &str {
+        &self.system_prompt
     }
 }

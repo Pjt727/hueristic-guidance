@@ -25,25 +25,68 @@ fn simulate_accuracy(
 
     for result in results {
         // Find the first step that has category_top_tokens populated.
-        let Some(step) = result.steps.iter().find(|s| !s.category_top_tokens.is_empty()) else {
+        let Some(step) = result
+            .steps
+            .iter()
+            .find(|s| !s.category_top_tokens.is_empty())
+        else {
             continue;
         };
 
         total += 1;
 
+        let embedding_enabled = fallback_kappa > 0.0 || kappas.values().any(|kappa| *kappa > 0.0);
+        let forced = embedding_enabled
+            .then(|| {
+                step.decision_diagnostics
+                    .as_ref()
+                    .and_then(|diagnostics| diagnostics.force_target.as_ref())
+                    .and_then(|target| {
+                        step.category_top_tokens
+                            .iter()
+                            .find(|category| &category.category_name == target)
+                    })
+            })
+            .flatten();
+        let has_diagnostics = step.decision_diagnostics.is_some();
+
         // Pick the category with the highest simulated total score.
-        let best = step.category_top_tokens.iter().max_by(|a, b| {
-            let kappa_a = kappas.get(&a.category_name).copied().unwrap_or(fallback_kappa);
-            let kappa_b = kappas.get(&b.category_name).copied().unwrap_or(fallback_kappa);
-            let score_a = a.best_token.logit as f64 + kappa_a * a.sim_score as f64;
-            let score_b = b.best_token.logit as f64 + kappa_b * b.sim_score as f64;
-            score_a.partial_cmp(&score_b).unwrap_or(std::cmp::Ordering::Equal)
+        let best = forced.or_else(|| {
+            step.category_top_tokens.iter().max_by(|a, b| {
+                let kappa_a = kappas
+                    .get(&a.category_name)
+                    .copied()
+                    .unwrap_or(fallback_kappa);
+                let kappa_b = kappas
+                    .get(&b.category_name)
+                    .copied()
+                    .unwrap_or(fallback_kappa);
+                let gain_a = (30.0 * (a.positive_similarity.min(0.90) - 0.90)).exp();
+                let gain_b = (30.0 * (b.positive_similarity.min(0.90) - 0.90)).exp();
+                let raw_a = if has_diagnostics {
+                    a.pre_bias_logit
+                } else {
+                    a.best_token.logit
+                };
+                let raw_b = if has_diagnostics {
+                    b.pre_bias_logit
+                } else {
+                    b.best_token.logit
+                };
+                let score_a =
+                    raw_a as f64 + kappa_a * a.sim_score.max(0.0) as f64 * gain_a as f64;
+                let score_b =
+                    raw_b as f64 + kappa_b * b.sim_score.max(0.0) as f64 * gain_b as f64;
+                score_a
+                    .partial_cmp(&score_b)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
         });
 
-        if let Some(token) = best {
-            if result.correct_categories.contains(&token.category_name) {
-                correct += 1;
-            }
+        if let Some(token) = best
+            && result.correct_categories.contains(&token.category_name)
+        {
+            correct += 1;
         }
     }
 
@@ -524,6 +567,9 @@ pub fn BulkTestPage() -> impl IntoView {
                                                 let llm_pct = eo.llm_accuracy_pct;
                                                 let bias_pct = eo.bias_corrected_accuracy_pct;
 
+                                                let has_tfidf = eo.baseline_accuracy.contains_key("tfidf")
+                                                    && !eo.weight_search.is_empty();
+
                                                 // Build weight search rows (select interesting points).
                                                 let weight_rows: Vec<_> = eo.weight_search.iter()
                                                     .filter(|wp| {
@@ -576,15 +622,21 @@ pub fn BulkTestPage() -> impl IntoView {
                                                                         </td>
                                                                     </tr>
                                                                 })}
-                                                                <tr style="border-bottom:1px solid #2a2a2a;">
-                                                                    <td style="padding:3px 12px; font-weight:bold;">
-                                                                        {format!("Best ensemble (TF-IDF {:.0}% / Embed {:.0}%)",
-                                                                            ow.tfidf_weight * 100.0, ow.embedding_weight * 100.0)}
-                                                                    </td>
-                                                                    <td style="padding:3px 12px; text-align:right; font-family:monospace; font-weight:bold; color:#4caf50;">
-                                                                        {fmt_pct(ow.accuracy_pct)}
-                                                                    </td>
-                                                                </tr>
+                                                                {if has_tfidf {
+                                                                    Some(view! {
+                                                                        <tr style="border-bottom:1px solid #2a2a2a;">
+                                                                            <td style="padding:3px 12px; font-weight:bold;">
+                                                                                {format!("Best ensemble (TF-IDF {:.0}% / Embed {:.0}%)",
+                                                                                    ow.tfidf_weight * 100.0, ow.embedding_weight * 100.0)}
+                                                                            </td>
+                                                                            <td style="padding:3px 12px; text-align:right; font-family:monospace; font-weight:bold; color:#4caf50;">
+                                                                                {fmt_pct(ow.accuracy_pct)}
+                                                                            </td>
+                                                                        </tr>
+                                                                    })
+                                                                } else {
+                                                                    None
+                                                                }}
                                                                 {bias_pct.map(|p| view! {
                                                                     <tr>
                                                                         <td style="padding:3px 12px; color:#aaa;">
@@ -599,43 +651,49 @@ pub fn BulkTestPage() -> impl IntoView {
                                                         </table>
 
                                                         // ── Weight search grid ─────────────
-                                                        <details style="margin-bottom:0.75rem;">
-                                                            <summary style="font-size:0.82rem; color:#aaa; cursor:pointer;">
-                                                                "Weight search grid (TF-IDF vs Embedding)"
-                                                            </summary>
-                                                            <table style="border-collapse:collapse; font-size:0.78rem; margin-top:0.3rem;">
-                                                                <thead>
-                                                                    <tr style="background:#1e1e1e;">
-                                                                        <th style="text-align:right; padding:2px 8px">"TF-IDF %"</th>
-                                                                        <th style="text-align:right; padding:2px 8px">"Embed %"</th>
-                                                                        <th style="text-align:right; padding:2px 8px">"Accuracy"</th>
-                                                                    </tr>
-                                                                </thead>
-                                                                <tbody>
-                                                                    {weight_rows.into_iter().map(|wp| {
-                                                                        let is_best = (wp.tfidf_weight - ow.tfidf_weight).abs() < 0.01;
-                                                                        let style = if is_best {
-                                                                            "border-bottom:1px solid #2a2a2a; background:#1a2e1a;"
-                                                                        } else {
-                                                                            "border-bottom:1px solid #2a2a2a;"
-                                                                        };
-                                                                        view! {
-                                                                            <tr style=style>
-                                                                                <td style="padding:2px 8px; text-align:right; font-family:monospace;">
-                                                                                    {format!("{:.0}", wp.tfidf_weight * 100.0)}
-                                                                                </td>
-                                                                                <td style="padding:2px 8px; text-align:right; font-family:monospace;">
-                                                                                    {format!("{:.0}", wp.embedding_weight * 100.0)}
-                                                                                </td>
-                                                                                <td style="padding:2px 8px; text-align:right; font-family:monospace;">
-                                                                                    {fmt_pct(wp.accuracy_pct)}
-                                                                                </td>
+                                                        {if has_tfidf {
+                                                            Some(view! {
+                                                                <details style="margin-bottom:0.75rem;">
+                                                                    <summary style="font-size:0.82rem; color:#aaa; cursor:pointer;">
+                                                                        "Weight search grid (TF-IDF vs Embedding)"
+                                                                    </summary>
+                                                                    <table style="border-collapse:collapse; font-size:0.78rem; margin-top:0.3rem;">
+                                                                        <thead>
+                                                                            <tr style="background:#1e1e1e;">
+                                                                                <th style="text-align:right; padding:2px 8px">"TF-IDF %"</th>
+                                                                                <th style="text-align:right; padding:2px 8px">"Embed %"</th>
+                                                                                <th style="text-align:right; padding:2px 8px">"Accuracy"</th>
                                                                             </tr>
-                                                                        }
-                                                                    }).collect_view()}
-                                                                </tbody>
-                                                            </table>
-                                                        </details>
+                                                                        </thead>
+                                                                        <tbody>
+                                                                            {weight_rows.into_iter().map(|wp| {
+                                                                                let is_best = (wp.tfidf_weight - ow.tfidf_weight).abs() < 0.01;
+                                                                                let style = if is_best {
+                                                                                    "border-bottom:1px solid #2a2a2a; background:#1a2e1a;"
+                                                                                } else {
+                                                                                    "border-bottom:1px solid #2a2a2a;"
+                                                                                };
+                                                                                view! {
+                                                                                    <tr style=style>
+                                                                                        <td style="padding:2px 8px; text-align:right; font-family:monospace;">
+                                                                                            {format!("{:.0}", wp.tfidf_weight * 100.0)}
+                                                                                        </td>
+                                                                                        <td style="padding:2px 8px; text-align:right; font-family:monospace;">
+                                                                                            {format!("{:.0}", wp.embedding_weight * 100.0)}
+                                                                                        </td>
+                                                                                        <td style="padding:2px 8px; text-align:right; font-family:monospace;">
+                                                                                            {fmt_pct(wp.accuracy_pct)}
+                                                                                        </td>
+                                                                                    </tr>
+                                                                                }
+                                                                            }).collect_view()}
+                                                                        </tbody>
+                                                                    </table>
+                                                                </details>
+                                                            })
+                                                        } else {
+                                                            None
+                                                        }}
 
                                                         // ── Temperature search ─────────────
                                                         <details style="margin-bottom:0.75rem;">
@@ -644,8 +702,13 @@ pub fn BulkTestPage() -> impl IntoView {
                                                                     ot.temperature, ot.accuracy_pct)}
                                                             </summary>
                                                             <p style="font-size:0.78rem; color:#666; margin:0.2rem 0;">
-                                                                "Tests softmax(embed_scores / T) combined with TF-IDF in a 50/50 ensemble. \
-                                                                 Lower T amplifies small embedding differences."
+                                                                {if has_tfidf {
+                                                                    "Tests softmax(embed_scores / T) combined with TF-IDF in a 50/50 ensemble. \
+                                                                     Lower T amplifies small embedding differences.".to_string()
+                                                                } else {
+                                                                    "Tests softmax(embed_scores / T). \
+                                                                     Lower T amplifies small embedding differences.".to_string()
+                                                                }}
                                                             </p>
                                                         </details>
 

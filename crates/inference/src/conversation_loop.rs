@@ -7,7 +7,7 @@ use llguidance::toktrie::TokenizerEnv;
 use crate::grammar::GrammarFlow;
 
 use crate::inference::Llm;
-use crate::llama_tokenizer::{END_TURN_TOKEN, ID_END_TOKEN, ID_START_TOKEN, LlamaTokenizerEnv};
+use crate::llama_tokenizer::LlamaTokenizerEnv;
 use crate::token::Canidate;
 
 pub struct ConversationInfo {
@@ -38,7 +38,9 @@ impl ConversationData {
 
     pub fn simple_hitl_generation(&mut self, max_tokens: usize, top_candidate_count: usize) {
         let initial_tokens = self.constraint.process_prompt(vec![]);
-        self.llm.feed_tokens(&initial_tokens);
+        self.llm
+            .feed_tokens(&initial_tokens)
+            .expect("feed prefix tokens");
 
         self.running_input = self.tokenizer.tokens_to_string(&initial_tokens);
 
@@ -48,12 +50,14 @@ impl ConversationData {
             .expect("Failed to read line");
         input = input.strip_suffix("\n").unwrap().to_string();
 
-        let initial_prompt = format!(
-            "{ID_START_TOKEN}user{ID_END_TOKEN}{input}{END_TURN_TOKEN}{ID_START_TOKEN}assistant{ID_END_TOKEN}{}",
-            self.running_input
-        );
+        let initial_prompt = self
+            .tokenizer
+            .chat_format
+            .wrap_user_turn(&input, &self.running_input);
         let initial_tokens = self.tokenizer.tokenize(&initial_prompt);
-        self.llm.feed_tokens(&initial_tokens);
+        self.llm
+            .feed_tokens(&initial_tokens)
+            .expect("feed user turn");
 
         println!("Conversation: ```\n{initial_prompt}\n```");
         self.running_input = initial_prompt;
@@ -94,10 +98,14 @@ impl ConversationData {
         }
 
         if ff_tokens.is_empty() {
-            self.llm.feed_tokens(&[last_token]);
+            self.llm
+                .feed_tokens(&[last_token])
+                .expect("feed chosen token");
             self.running_input += &self.tokenizer.tokens_to_string(&[last_token]);
         } else {
-            self.llm.feed_tokens(&ff_tokens);
+            self.llm
+                .feed_tokens(&ff_tokens)
+                .expect("feed fast-forward tokens");
             self.running_input += &self.tokenizer.tokens_to_string(&ff_tokens);
         }
 

@@ -30,6 +30,8 @@ pub struct CategoryScore {
     /// Raw embedding margin for this category (before kappa multiplication).
     /// 0.0 if embedding biases were not active for this run.
     pub sim_score: f32,
+    pub positive_similarity: f32,
+    pub force_target: bool,
 }
 
 /// All per-category scores for one validation example.
@@ -63,7 +65,7 @@ pub fn optimize_weights(examples: &[ExampleData]) -> Option<HashMap<String, f64>
         for ex in examples {
             for (name, score) in &ex.category_scores {
                 let entry = seen.entry(name.clone()).or_insert(false);
-                if score.sim_score != 0.0 {
+                if curved_feature(score) != 0.0 {
                     *entry = true;
                 }
             }
@@ -93,6 +95,9 @@ pub fn optimize_weights(examples: &[ExampleData]) -> Option<HashMap<String, f64>
     let usable: Vec<&ExampleData> = examples
         .iter()
         .filter(|ex| {
+            if ex.category_scores.values().any(|score| score.force_target) {
+                return false;
+            }
             let has_correct = ex
                 .correct_categories
                 .iter()
@@ -125,7 +130,7 @@ pub fn optimize_weights(examples: &[ExampleData]) -> Option<HashMap<String, f64>
                 .iter()
                 .filter_map(|(name, cs)| {
                     let idx = *cat_index.get(name.as_str())?;
-                    Some((idx, cs.logit as f64, cs.sim_score as f64))
+                    Some((idx, cs.logit as f64, curved_feature(cs) as f64))
                 })
                 .collect();
             scores.sort_by_key(|(idx, _, _)| *idx);
@@ -143,7 +148,10 @@ pub fn optimize_weights(examples: &[ExampleData]) -> Option<HashMap<String, f64>
                         .unwrap_or(false)
                 })
                 .collect();
-            ExFlat { scores, correct_mask }
+            ExFlat {
+                scores,
+                correct_mask,
+            }
         })
         .collect();
 
@@ -186,7 +194,11 @@ pub fn optimize_weights(examples: &[ExampleData]) -> Option<HashMap<String, f64>
             // but only for k where cat_idx[k] == c.
             for pos in 0..n {
                 let (cat_idx, _, sim) = ex.scores[pos];
-                let target = if ex.correct_mask[pos] { target_val } else { 0.0 };
+                let target = if ex.correct_mask[pos] {
+                    target_val
+                } else {
+                    0.0
+                };
                 let delta = prob[pos] - target;
                 grad[cat_idx] += sim * delta;
             }
@@ -216,14 +228,12 @@ pub fn optimize_weights(examples: &[ExampleData]) -> Option<HashMap<String, f64>
 
 /// Compute classification accuracy for a set of examples using given kappa values.
 /// Returns (correct_count, total, per_category_accuracy).
-pub fn eval_accuracy(
-    examples: &[ExampleData],
-    kappa_map: &HashMap<String, f64>,
-) -> AccuracyReport {
+pub fn eval_accuracy(examples: &[ExampleData], kappa_map: &HashMap<String, f64>) -> AccuracyReport {
     let mut correct = 0usize;
     let mut total = 0usize;
     let mut per_category_correct: HashMap<String, usize> = HashMap::new();
     let mut per_category_total: HashMap<String, usize> = HashMap::new();
+    let embedding_enabled = kappa_map.values().any(|kappa| *kappa > 0.0);
 
     for ex in examples {
         if ex.correct_categories.is_empty() {
@@ -231,13 +241,24 @@ pub fn eval_accuracy(
         }
         total += 1;
 
-        // Compute score for each category: logit + kappa * sim_score
-        let mut best_cat: Option<(String, f64)> = None;
-        for (name, cs) in &ex.category_scores {
-            let k = kappa_map.get(name).copied().unwrap_or(0.0);
-            let score = cs.logit as f64 + k * cs.sim_score as f64;
-            if best_cat.as_ref().map_or(true, |(_, s)| score > *s) {
-                best_cat = Some((name.clone(), score));
+        let mut best_cat = embedding_enabled
+            .then(|| {
+                ex.category_scores
+                    .iter()
+                    .find(|(_, score)| score.force_target)
+                    .map(|(name, _)| (name.clone(), f64::INFINITY))
+            })
+            .flatten();
+        if best_cat.is_none() {
+            for (name, cs) in &ex.category_scores {
+                let k = kappa_map.get(name).copied().unwrap_or(0.0);
+                let score = cs.logit as f64 + k * curved_feature(cs) as f64;
+                if best_cat
+                    .as_ref()
+                    .is_none_or(|(_, best_score)| score > *best_score)
+                {
+                    best_cat = Some((name.clone(), score));
+                }
             }
         }
 
@@ -290,6 +311,14 @@ pub fn eval_accuracy(
     }
 }
 
+fn curved_feature(score: &CategoryScore) -> f32 {
+    score.sim_score.max(0.0)
+        * inference::embedding_bias::soft_gain(
+            score.positive_similarity,
+            inference::EmbeddingBiasConfig::default(),
+        )
+}
+
 /// Accuracy report for a kappa configuration.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct AccuracyReport {
@@ -315,7 +344,12 @@ mod tests {
     use super::*;
 
     fn make_score(logit: f32, sim: f32) -> CategoryScore {
-        CategoryScore { logit, sim_score: sim }
+        CategoryScore {
+            logit,
+            sim_score: sim,
+            positive_similarity: 0.9,
+            force_target: false,
+        }
     }
 
     /// With two categories and an example where the incorrect category has a

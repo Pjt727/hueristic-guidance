@@ -8,8 +8,8 @@ use axum::{
 };
 use inference::{CategoryBias, GrammarFlow, InferenceEvent};
 use serde::{Deserialize, Serialize};
-use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt as _;
+use tokio_stream::wrappers::ReceiverStream;
 
 use crate::db;
 use crate::embedding;
@@ -63,7 +63,10 @@ pub async fn start_infer(
         })?;
 
     // Start generation — non-blocking
-    let rx = state.engine.generate(body.prompt, grammar_flow, category_biases).await;
+    let rx = state
+        .engine
+        .generate(body.prompt, grammar_flow, category_biases)
+        .await;
 
     // Store receiver so the SSE handler can pick it up
     state.sessions.lock().await.insert(session_id.clone(), rx);
@@ -110,19 +113,7 @@ async fn compute_category_biases(
         }
     };
 
-    let mut biases = Vec::with_capacity(margins.len());
-    for m in &margins {
-        let kappa = db::get_or_create_kappa(&state.db, m.message_id)
-            .await
-            .unwrap_or(10.0);
-        biases.push(CategoryBias {
-            category_name: m.category_name.clone(),
-            weighted_margin: (kappa * m.margin) as f32,
-            sim_score: m.margin as f32,
-        });
-    }
-
-    biases
+    crate::category_biases::assemble(&state.db, &margins).await
 }
 
 /// GET /infer/stream/:session_id
@@ -170,7 +161,11 @@ pub async fn stream_sse(
                     }
                 });
             }
-            InferenceEvent::Done { full_text } => {
+            InferenceEvent::Done {
+                full_text,
+                latency_ms: _,
+                category_latency_ms: _,
+            } => {
                 let db = db2.clone();
                 let sid = sid2.clone();
                 let text = full_text.clone();

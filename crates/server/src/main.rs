@@ -1,5 +1,7 @@
+mod category_biases;
 mod db;
 mod embedding;
+mod llm_validation;
 mod optimize;
 mod routes;
 mod state;
@@ -68,19 +70,12 @@ async fn main() -> anyhow::Result<()> {
     let brand_name = std::env::var("BRAND_NAME").unwrap_or_else(|_| "Pemazyre".to_string());
 
     // --- Standalone classifiers ---------------------------------------------
-    // Initialize classifiers based on available models/API keys.
-    // TF-IDF is always available; embedding classifiers depend on API key / model file.
+    // Classifiers are built per-request with agent-specific categories.
     let classifiers: Vec<Arc<dyn classifiers::Classifier>> = {
-        // Load a default set of category definitions for classifier initialization.
-        // These will be used for the TF-IDF vocabulary/IDF computation.
-        // When classifying for a specific agent, categories are passed to classify().
-        // TF-IDF is rebuilt per-agent at request time if categories differ, but having
-        // a default ensures the classifier is available immediately.
-        // Classifiers are built per-request with agent-specific categories.
-        // We log which methods will be available.
-        tracing::info!("TF-IDF classifier available (initialized per-request with agent categories)");
         if std::env::var("OPENAI_API_KEY").is_ok() {
             tracing::info!("OpenAI embedding classifier available (API key set)");
+        } else {
+            tracing::warn!("OPENAI_API_KEY not set — OpenAI embedding classifier unavailable");
         }
         vec![]
     };
@@ -93,6 +88,9 @@ async fn main() -> anyhow::Result<()> {
         vc_db,
         sessions: Arc::new(Mutex::new(HashMap::new())),
         bulk_test_sessions: Arc::new(Mutex::new(HashMap::new())),
+        llm_validation_sessions: Arc::new(Mutex::new(HashMap::new())),
+        llm_validation_pending: Arc::new(Mutex::new(HashMap::new())),
+        llm_validation_cancel: Arc::new(Mutex::new(HashMap::new())),
         classifiers,
     };
 
@@ -100,6 +98,7 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/health", get(routes::health::handler))
         .route("/agents", get(routes::agents::list_agents))
+        .route("/agent-versions", get(routes::llm_validation::list_versions))
         .route("/agents/{agent_id}/system-prompt", get(routes::agents::get_system_prompt))
         .route("/infer", post(routes::infer::start_infer))
         .route("/infer/stream/{session_id}", get(routes::infer::stream_sse))
@@ -114,6 +113,19 @@ async fn main() -> anyhow::Result<()> {
         .route("/classify/compare", post(routes::classify::start_compare))
         .route("/classify/compare/{run_id}", get(routes::classify::get_compare_results))
         .route("/classify/compare-runs", get(routes::classify::list_compare_runs))
+        .route("/llm-validation", post(routes::llm_validation::start_validation))
+        .route(
+            "/llm-validation/stream/{session_id}",
+            get(routes::llm_validation::stream_validation),
+        )
+        .route(
+            "/llm-validation/{session_id}/decision",
+            post(routes::llm_validation::decide_validation),
+        )
+        .route(
+            "/llm-validation/{session_id}/cancel",
+            post(routes::llm_validation::cancel_validation),
+        )
         .layer(CorsLayer::permissive())
         .with_state(state);
 

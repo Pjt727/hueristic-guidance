@@ -13,10 +13,38 @@ pub struct Canidate {
     pub embedding_logit: f32,
 }
 
+#[derive(Clone)]
 pub struct Canidates {
     canidates: Vec<Canidate>,
     /// O(1) lookup: token_id → index in `canidates`. Rebuilt after every sort.
     by_id: HashMap<TokenID, usize>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_bias_map_preserves_raw_order() {
+        let mut candidates = Canidates::new(vec![
+            Canidate {
+                token_id: 1,
+                probability: 0.0,
+                logit: 3.0,
+                embedding_logit: 0.0,
+            },
+            Canidate {
+                token_id: 2,
+                probability: 0.0,
+                logit: 1.0,
+                embedding_logit: 0.0,
+            },
+        ]);
+        candidates.apply_biases(&HashMap::new());
+        let top = candidates.top_n(2);
+        assert_eq!(top[0].token_id, 1);
+        assert!(top.iter().all(|candidate| candidate.embedding_logit == 0.0));
+    }
 }
 
 impl Canidates {
@@ -31,6 +59,24 @@ impl Canidates {
         self.by_id.get(&token_id).map(|&i| &self.canidates[i])
     }
 
+    /// Return one candidate with probability normalized over the current set.
+    pub fn get_with_probability(&self, token_id: TokenID) -> Option<Canidate> {
+        let mut candidate = self.get_by_id(token_id)?.clone();
+        let max_logit = self
+            .canidates
+            .iter()
+            .map(|item| item.logit + item.embedding_logit)
+            .fold(f32::NEG_INFINITY, f32::max);
+        let sum: f32 = self
+            .canidates
+            .iter()
+            .map(|item| (item.logit + item.embedding_logit - max_logit).exp())
+            .sum();
+        candidate.probability =
+            (candidate.logit + candidate.embedding_logit - max_logit).exp() / sum;
+        Some(candidate)
+    }
+
     /// Apply per-token logit biases from the embedding similarity algorithm.
     /// Sets each candidate's `embedding_logit` to the precomputed w(v) value.
     /// The raw `logit` field is left unchanged; adjusted logit = logit + embedding_logit.
@@ -39,8 +85,9 @@ impl Canidates {
         for c in &mut self.canidates {
             c.embedding_logit = biases.get(&c.token_id).copied().unwrap_or(0.0);
         }
-        self.canidates
-            .sort_by(|a, b| (b.logit + b.embedding_logit).total_cmp(&(a.logit + a.embedding_logit)));
+        self.canidates.sort_by(|a, b| {
+            (b.logit + b.embedding_logit).total_cmp(&(a.logit + a.embedding_logit))
+        });
         self.by_id = build_index(&self.canidates);
     }
 

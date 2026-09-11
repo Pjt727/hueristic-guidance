@@ -1,23 +1,29 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use llama_cpp_2::{
     llama_backend::LlamaBackend,
-    model::{Special, params::LlamaModelParams, LlamaModel},
+    model::{LlamaModel, params::LlamaModelParams},
 };
 use llguidance::toktrie::TokenizerEnv;
 use tokio::sync::mpsc;
 
-use crate::constraints::new_default_constraint;
+use crate::constraints::{new_constraint, new_parser_factory};
+use crate::embedding_bias::ResolvedCategoryBias;
 use crate::grammar::GrammarFlow;
 use crate::inference::{LlamaLlm, Llm};
-use crate::llama_tokenizer::{END_TURN_TOKEN, ID_END_TOKEN, ID_START_TOKEN, LlamaTokenizerEnv};
-use crate::token::TokenID;
-use inference_types::{CategoryTopToken, InferenceEvent, StepCandidates, TokenWithProb};
+use crate::llama_tokenizer::LlamaTokenizerEnv;
+use crate::token::{Canidates, TokenID};
+use inference_types::{
+    BiasRegime, CategoryDistributionMetrics, CategoryTopToken, DecisionDiagnostics, InferenceEvent,
+    OverrideOutcome, StepCandidates, TokenWithProb,
+};
+use llguidance::ParserFactory;
 
 /// Scaling constant and category name used to adjust token logits based on
 /// embedding cosine similarity between the user message and VC message examples.
+#[derive(Debug, Clone)]
 pub struct CategoryBias {
     /// The name of the VC message category (e.g. "referral").
     pub category_name: String,
@@ -26,6 +32,24 @@ pub struct CategoryBias {
     /// Raw margin before kappa multiplication: max_pos_similarity - max_neg_similarity.
     /// Stored in CategoryTopToken.sim_score for per-category weight optimization.
     pub sim_score: f32,
+    pub positive_similarity: f32,
+    pub negative_similarity: f32,
+    pub regime: BiasRegime,
+    pub force_target: bool,
+}
+
+impl From<ResolvedCategoryBias> for CategoryBias {
+    fn from(value: ResolvedCategoryBias) -> Self {
+        Self {
+            category_name: value.category_name,
+            weighted_margin: value.weighted_margin,
+            sim_score: value.sim_score,
+            positive_similarity: value.positive_similarity,
+            negative_similarity: value.negative_similarity,
+            regime: value.regime,
+            force_target: value.force_target,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -36,10 +60,40 @@ pub struct InferenceConfig {
     pub top_candidate_count: usize,
 }
 
+struct HotSystemKv {
+    hash: String,
+    llm: LlamaLlm,
+}
+
+// SAFETY: `LlamaContext` is not `Send`, but we only ever touch `llm` while holding
+// `InferenceEngineInner::hot_system_kv`. That mutex serializes all access across
+// spawn_blocking workers, so no concurrent use of the context occurs.
+unsafe impl Send for HotSystemKv {}
+
 struct InferenceEngineInner {
     backend: LlamaBackend,
     model: Arc<LlamaModel>,
     config: InferenceConfig,
+    /// Built once at engine load — vocab trie construction is expensive (~248k tokens).
+    tokenizer: Arc<LlamaTokenizerEnv>,
+    /// Shared llguidance factory; only the per-request grammar parser is rebuilt.
+    parser_factory: ParserFactory,
+    /// Last system-prompt KV kept in memory. Evicted when the system prompt hash changes.
+    hot_system_kv: Mutex<Option<HotSystemKv>>,
+}
+
+/// Restores the system-prompt SeqState snapshot when dropped so the next
+/// request can reuse in-memory attention without a disk reload.
+struct RestoreOnDrop<'a> {
+    llm: &'a mut LlamaLlm,
+}
+
+impl Drop for RestoreOnDrop<'_> {
+    fn drop(&mut self) {
+        if let Err(e) = self.llm.restore_system_prompt_state() {
+            tracing::warn!(error = %e, "failed to restore system prompt state on drop");
+        }
+    }
 }
 
 /// The main inference engine. Cheap to clone — internally reference-counted.
@@ -55,10 +109,18 @@ impl InferenceEngine {
         let model = LlamaModel::load_from_file(&backend, &config.model_path, &model_params)?;
         let model = Arc::new(model);
 
+        tracing::info!("building tokenizer / toktrie (one-time)…");
+        let tokenizer = Arc::new(LlamaTokenizerEnv::new(model.clone())?);
+        let tok_env: Arc<dyn TokenizerEnv + Sync + 'static> = tokenizer.clone();
+        let parser_factory = new_parser_factory(&tok_env);
+
         Ok(Self(Arc::new(InferenceEngineInner {
             backend,
             model,
             config,
+            tokenizer,
+            parser_factory,
+            hot_system_kv: Mutex::new(None),
         })))
     }
 
@@ -93,51 +155,126 @@ fn run_generation_blocking(
     category_biases: Vec<CategoryBias>,
     tx: mpsc::Sender<InferenceEvent>,
 ) {
-    // Build per-request tokenizer (just wraps Arc<LlamaModel>, cheap)
-    let tokenizer = Arc::new(LlamaTokenizerEnv::new(inner.model.clone()));
+    let started = std::time::Instant::now();
+    let mut category_latency_ms: Option<u64> = None;
+    let send_done = |tx: &mpsc::Sender<InferenceEvent>,
+                     full_text: String,
+                     category_latency_ms: Option<u64>| {
+        let _ = tx.blocking_send(InferenceEvent::Done {
+            full_text,
+            latency_ms: started.elapsed().as_millis() as u64,
+            category_latency_ms,
+        });
+    };
+
+    let tokenizer = Arc::clone(&inner.tokenizer);
 
     // Precompute per-token logit bias map, category name/text pairs, and
     // per-category token ID lists for per-step "best token per category" lookup.
     let (logit_bias_map, category_info, category_token_ids) =
         build_logit_bias_map(&category_biases, &tokenizer, &inner.model);
 
-    // Build a map of category_name → raw sim_score for populating CategoryTopToken.
-    let category_sim_scores: HashMap<String, f32> = category_biases
+    let category_bias_details: HashMap<String, CategoryBias> = category_biases
         .iter()
-        .map(|b| (b.category_name.clone(), b.sim_score))
+        .cloned()
+        .map(|bias| (bias.category_name.clone(), bias))
         .collect();
+    let force_target = category_biases
+        .iter()
+        .find(|bias| bias.force_target)
+        .map(|bias| bias.category_name.clone());
 
-    // Tokenize the system prompt and build the LLM context (cached to disk)
-    let system_prompt = grammar_flow.get_system_prompt();
+    // Tokenize the system prompt and reuse in-memory KV when the hash matches.
+    let system_prompt = tokenizer
+        .chat_format
+        .wrap_system(grammar_flow.get_system_prompt());
     let initial_tokens: Vec<_> = tokenizer.tokenize(&system_prompt);
-    let mut llm = LlamaLlm::new(
-        &inner.backend,
-        inner.model.clone(),
-        &initial_tokens,
-        &inner.config.context_cache_dir,
-    );
+    let system_hash = LlamaLlm::system_token_hash(&initial_tokens);
 
-    // Build a fresh constraint for this request
-    let tok_env: Arc<dyn TokenizerEnv + Sync + 'static> =
-        Arc::new(LlamaTokenizerEnv::new(inner.model.clone()));
-    let mut constraint = new_default_constraint(&grammar_flow, &tok_env);
+    let mut hot_guard = inner
+        .hot_system_kv
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let reuse = hot_guard
+        .as_ref()
+        .is_some_and(|hot| hot.hash == system_hash);
+    if reuse {
+        if let Err(e) = hot_guard
+            .as_mut()
+            .expect("checked above")
+            .llm
+            .restore_system_prompt_state()
+        {
+            tracing::warn!(error = %e, %system_hash, "hot KV restore failed — rebuilding");
+            *hot_guard = None;
+        }
+    }
+    if hot_guard
+        .as_ref()
+        .is_none_or(|hot| hot.hash != system_hash)
+    {
+        tracing::info!(%system_hash, "loading system prompt KV (disk or compute)");
+        let llm = match LlamaLlm::new(
+            &inner.backend,
+            inner.model.clone(),
+            &initial_tokens,
+            &inner.config.context_cache_dir,
+        ) {
+            Ok(llm) => llm,
+            Err(e) => {
+                let _ = tx.blocking_send(InferenceEvent::Error {
+                    message: e.to_string(),
+                });
+                return;
+            }
+        };
+        *hot_guard = Some(HotSystemKv {
+            hash: system_hash,
+            llm,
+        });
+    }
+    let llm = &mut hot_guard.as_mut().expect("hot KV just ensured").llm;
+    let llm = RestoreOnDrop { llm };
+
+    // Fresh grammar parser per request; factory + tokenizer are reused.
+    let mut constraint = new_constraint(&inner.parser_factory, &grammar_flow);
 
     // Process the grammar prompt prefix (may return tokens the LLM should see first)
     let prefix_tokens = constraint.process_prompt(vec![]);
     let prefix_text = tokenizer.tokens_to_string(&prefix_tokens);
-    llm.feed_tokens(&prefix_tokens);
+    let force_tokens = force_target
+        .as_ref()
+        .map(|target| remaining_force_tokens(target, &prefix_text, &tokenizer))
+        .unwrap_or_default();
+    let mut force_token_index = 0usize;
+    if let Err(e) = llm.llm.feed_tokens(&prefix_tokens) {
+        let _ = tx.blocking_send(InferenceEvent::Error {
+            message: e.to_string(),
+        });
+        return;
+    }
 
     // Format the user turn including any prefix from the grammar
-    let user_turn = format!(
-        "{ID_START_TOKEN}user{ID_END_TOKEN}{prompt}{END_TURN_TOKEN}{ID_START_TOKEN}assistant{ID_END_TOKEN}{prefix_text}"
-    );
+    let user_turn = tokenizer
+        .chat_format
+        .wrap_user_turn(&prompt, &prefix_text);
     let user_tokens: Vec<_> = tokenizer.tokenize(&user_turn);
-    llm.feed_tokens(&user_tokens);
+    if let Err(e) = llm.llm.feed_tokens(&user_tokens) {
+        let _ = tx.blocking_send(InferenceEvent::Error {
+            message: e.to_string(),
+        });
+        return;
+    }
 
-    let mut full_output = String::new();
+    // Accumulate token IDs and decode once for Done. Per-token UTF-8 decode
+    // fails on Qwen byte-fallback pieces and used to poison full_text with
+    // the literal "Invalid utf-8", breaking bulk category matching.
+    let mut output_tokens: Vec<TokenID> = Vec::new();
+    let full_text = |tokens: &[TokenID]| tokenizer.tokens_to_string(tokens);
 
     for _ in 0..inner.config.max_tokens {
-        let mut candidates = llm.get_canidates();
+        let mut raw_candidates = llm.llm.get_canidates();
+        let mut candidates = raw_candidates.clone();
 
         // Apply embedding-based logit biases before any top_n sampling.
         candidates.apply_biases(&logit_bias_map);
@@ -168,12 +305,11 @@ fn run_generation_blocking(
         let sample_mask = match &mask.sample_mask {
             Some(m) => m,
             None => {
-                let _ = tx.blocking_send(InferenceEvent::Done {
-                    full_text: full_output,
-                });
+                send_done(&tx, full_text(&output_tokens), category_latency_ms);
                 return;
             }
         };
+        raw_candidates.constrain(sample_mask);
         candidates.constrain(sample_mask);
 
         // Top-N after mask (adjusted logits)
@@ -189,48 +325,80 @@ fn run_generation_blocking(
             })
             .collect();
 
-        let chosen = match top_constrained.first() {
+        let normal_chosen = match top_constrained.first() {
             Some(c) => c.clone(),
             None => {
-                let _ = tx.blocking_send(InferenceEvent::Done {
-                    full_text: full_output,
-                });
+                send_done(&tx, full_text(&output_tokens), category_latency_ms);
                 return;
             }
         };
+        let forced_candidate = forced_token_id(&force_tokens, force_token_index, &candidates)
+            .and_then(|token_id| candidates.get_with_probability(token_id))
+            .map(|candidate| TokenWithProb {
+                text: tokenizer.tokens_to_string(&[candidate.token_id]),
+                token_id: candidate.token_id,
+                probability: candidate.probability,
+                logit: candidate.logit,
+                embedding_logit: candidate.embedding_logit,
+            });
+        let force_applied = forced_candidate.is_some();
+        let chosen = forced_candidate.unwrap_or(normal_chosen);
         let chosen_token_id = chosen.token_id;
 
         // For every category find the best-scoring prefix token using the full
         // pre-mask candidate list (O(1) per token via the HashMap index).
         // This shows all categories, not just those whose tokens happen to be in top-N.
-        let category_top_tokens: Vec<CategoryTopToken> = category_info
-            .iter()
-            .zip(category_token_ids.iter())
-            .filter_map(|((cat_name, _), token_ids)| {
-                token_ids
+        let mut category_top_tokens = build_category_top_tokens(
+            &category_info,
+            &category_token_ids,
+            &raw_candidates,
+            &candidates,
+            &category_bias_details,
+            &tokenizer,
+        );
+        populate_category_probabilities(&mut category_top_tokens);
+        if category_latency_ms.is_none() && !category_top_tokens.is_empty() {
+            category_latency_ms = Some(started.elapsed().as_millis() as u64);
+        }
+        let decision_diagnostics = if category_top_tokens.is_empty() {
+            None
+        } else {
+            let pre_bias = distribution_metrics(
+                category_top_tokens
                     .iter()
-                    .filter_map(|&tid| candidates.get_by_id(tid))
-                    .max_by(|a, b| {
-                        (a.logit + a.embedding_logit)
-                            .partial_cmp(&(b.logit + b.embedding_logit))
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                    })
-                    .map(|best| CategoryTopToken {
-                        category_name: cat_name.clone(),
-                        best_token: TokenWithProb {
-                            text: tokenizer.tokens_to_string(&[best.token_id]),
-                            token_id: best.token_id,
-                            probability: best.probability,
-                            logit: best.logit,
-                            embedding_logit: best.embedding_logit,
-                        },
-                        sim_score: category_sim_scores
-                            .get(cat_name.as_str())
-                            .copied()
-                            .unwrap_or(0.0),
-                    })
+                    .map(|category| (&category.category_name, category.pre_bias_logit)),
+            );
+            let post_bias = distribution_metrics(
+                category_top_tokens
+                    .iter()
+                    .map(|category| (&category.category_name, category.post_bias_logit)),
+            );
+            let bias_regime = if force_target.is_some() {
+                BiasRegime::Force
+            } else if category_biases.is_empty() {
+                BiasRegime::None
+            } else {
+                BiasRegime::Soft
+            };
+            let override_outcome = if force_applied {
+                if force_target.as_ref() != pre_bias.winner_category.as_ref() {
+                    OverrideOutcome::ForcedEmbedding
+                } else {
+                    OverrideOutcome::None
+                }
+            } else if pre_bias.winner_category != post_bias.winner_category {
+                OverrideOutcome::SoftBias
+            } else {
+                OverrideOutcome::None
+            };
+            Some(DecisionDiagnostics {
+                pre_bias,
+                post_bias,
+                bias_regime,
+                force_target: force_target.clone(),
+                override_outcome,
             })
-            .collect();
+        };
 
         if tx
             .blocking_send(InferenceEvent::Token(StepCandidates {
@@ -238,6 +406,7 @@ fn run_generation_blocking(
                 top_alternatives,
                 top_constrained,
                 category_top_tokens,
+                decision_diagnostics,
             }))
             .is_err()
         {
@@ -255,6 +424,17 @@ fn run_generation_blocking(
             }
         };
         let ff_tokens = commit.ff_tokens;
+        if ff_tokens.is_empty() {
+            if force_tokens.get(force_token_index) == Some(&chosen_token_id) {
+                force_token_index += 1;
+            }
+        } else {
+            for token_id in &ff_tokens {
+                if force_tokens.get(force_token_index) == Some(token_id) {
+                    force_token_index += 1;
+                }
+            }
+        }
 
         // Emit Token events for grammar-forced fast-forward tokens (ff_tokens[0]
         // is the chosen token already sent above; start from index 1).
@@ -275,6 +455,7 @@ fn run_generation_blocking(
                     top_alternatives: vec![],
                     top_constrained: vec![ff_token],
                     category_top_tokens: vec![],
+                    decision_diagnostics: None,
                 }))
                 .is_err()
             {
@@ -297,29 +478,171 @@ fn run_generation_blocking(
 
         // Feed all committed tokens to the LLM KV cache
         if ff_tokens.is_empty() {
-            llm.feed_tokens(&[chosen_token_id]);
-            full_output += &tokenizer.tokens_to_string(&[chosen_token_id]);
+            if let Err(e) = llm.llm.feed_tokens(&[chosen_token_id]) {
+                let _ = tx.blocking_send(InferenceEvent::Error {
+                    message: e.to_string(),
+                });
+                return;
+            }
+            output_tokens.push(chosen_token_id);
         } else {
-            llm.feed_tokens(&ff_tokens);
-            full_output += &tokenizer.tokens_to_string(&ff_tokens);
+            if let Err(e) = llm.llm.feed_tokens(&ff_tokens) {
+                let _ = tx.blocking_send(InferenceEvent::Error {
+                    message: e.to_string(),
+                });
+                return;
+            }
+            output_tokens.extend_from_slice(&ff_tokens);
         }
 
         if generation_done {
-            let _ = tx.blocking_send(InferenceEvent::Done {
-                full_text: full_output,
-            });
+            send_done(&tx, full_text(&output_tokens), category_latency_ms);
             return;
         }
     }
 
-    let _ = tx.blocking_send(InferenceEvent::Done {
-        full_text: full_output,
-    });
+    send_done(&tx, full_text(&output_tokens), category_latency_ms);
 }
 
 // ---------------------------------------------------------------------------
 // Logit bias precomputation
 // ---------------------------------------------------------------------------
+
+fn build_category_top_tokens(
+    category_info: &[(String, String)],
+    category_token_ids: &[Vec<TokenID>],
+    raw_candidates: &Canidates,
+    adjusted_candidates: &Canidates,
+    bias_details: &HashMap<String, CategoryBias>,
+    tokenizer: &LlamaTokenizerEnv,
+) -> Vec<CategoryTopToken> {
+    category_info
+        .iter()
+        .zip(category_token_ids)
+        .filter_map(|((category_name, _), token_ids)| {
+            let raw_best = token_ids
+                .iter()
+                .filter_map(|token_id| raw_candidates.get_by_id(*token_id))
+                .max_by(|a, b| a.logit.total_cmp(&b.logit))?;
+            let adjusted_best = token_ids
+                .iter()
+                .filter_map(|token_id| adjusted_candidates.get_by_id(*token_id))
+                .max_by(|a, b| {
+                    (a.logit + a.embedding_logit).total_cmp(&(b.logit + b.embedding_logit))
+                })?;
+            let details = bias_details.get(category_name);
+            Some(CategoryTopToken {
+                category_name: category_name.clone(),
+                best_token: TokenWithProb {
+                    text: tokenizer.tokens_to_string(&[adjusted_best.token_id]),
+                    token_id: adjusted_best.token_id,
+                    probability: adjusted_best.probability,
+                    logit: adjusted_best.logit,
+                    embedding_logit: adjusted_best.embedding_logit,
+                },
+                sim_score: details.map(|bias| bias.sim_score).unwrap_or(0.0),
+                positive_similarity: details.map(|bias| bias.positive_similarity).unwrap_or(0.0),
+                negative_similarity: details.map(|bias| bias.negative_similarity).unwrap_or(0.0),
+                pre_bias_logit: raw_best.logit,
+                post_bias_logit: adjusted_best.logit + adjusted_best.embedding_logit,
+                pre_bias_probability: 0.0,
+                post_bias_probability: 0.0,
+            })
+        })
+        .collect()
+}
+
+fn populate_category_probabilities(categories: &mut [CategoryTopToken]) {
+    if categories.is_empty() {
+        return;
+    }
+    let raw_max = categories
+        .iter()
+        .map(|category| category.pre_bias_logit)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let post_max = categories
+        .iter()
+        .map(|category| category.post_bias_logit)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let raw_sum: f32 = categories
+        .iter()
+        .map(|category| (category.pre_bias_logit - raw_max).exp())
+        .sum();
+    let post_sum: f32 = categories
+        .iter()
+        .map(|category| (category.post_bias_logit - post_max).exp())
+        .sum();
+    for category in categories {
+        category.pre_bias_probability = (category.pre_bias_logit - raw_max).exp() / raw_sum;
+        category.post_bias_probability = (category.post_bias_logit - post_max).exp() / post_sum;
+    }
+}
+
+fn distribution_metrics<'a>(
+    scores: impl Iterator<Item = (&'a String, f32)>,
+) -> CategoryDistributionMetrics {
+    let mut scores: Vec<(&String, f32)> = scores.collect();
+    if scores.is_empty() {
+        return CategoryDistributionMetrics::default();
+    }
+    scores.sort_by(|a, b| b.1.total_cmp(&a.1));
+    let max_score = scores[0].1;
+    let exps: Vec<f32> = scores
+        .iter()
+        .map(|(_, score)| (*score - max_score).exp())
+        .collect();
+    let sum: f32 = exps.iter().sum();
+    let entropy = exps
+        .iter()
+        .map(|value| value / sum)
+        .filter(|probability| *probability > 0.0)
+        .map(|probability| -probability * probability.ln())
+        .sum::<f32>();
+    let normalized_entropy = if scores.len() > 1 {
+        entropy / (scores.len() as f32).ln()
+    } else {
+        0.0
+    };
+    CategoryDistributionMetrics {
+        winner_category: Some(scores[0].0.clone()),
+        top_two_margin: scores
+            .get(1)
+            .map(|runner_up| scores[0].1 - runner_up.1)
+            .unwrap_or(0.0),
+        normalized_entropy,
+    }
+}
+
+fn forced_token_id(
+    force_tokens: &[TokenID],
+    force_token_index: usize,
+    candidates: &Canidates,
+) -> Option<TokenID> {
+    force_tokens
+        .get(force_token_index)
+        .copied()
+        .filter(|token_id| candidates.get_by_id(*token_id).is_some())
+}
+
+fn remaining_force_tokens(
+    target: &str,
+    prefix_text: &str,
+    tokenizer: &LlamaTokenizerEnv,
+) -> Vec<TokenID> {
+    tokenizer.tokenize(&remaining_force_text(target, prefix_text))
+}
+
+fn remaining_force_text(target: &str, prefix_text: &str) -> String {
+    let force_text = format!(" {target}");
+    let consumed = force_text
+        .char_indices()
+        .map(|(index, _)| index)
+        .chain(std::iter::once(force_text.len()))
+        .filter(|index| prefix_text.ends_with(&force_text[..*index]))
+        .max()
+        .unwrap_or(0);
+    force_text[consumed..].to_string()
+}
 
 /// Build a map from token ID → logit adjustment w(v).
 ///
@@ -347,7 +670,11 @@ fn build_logit_bias_map(
     biases: &[CategoryBias],
     tokenizer: &LlamaTokenizerEnv,
     model: &LlamaModel,
-) -> (HashMap<TokenID, f32>, Vec<(String, String)>, Vec<Vec<TokenID>>) {
+) -> (
+    HashMap<TokenID, f32>,
+    Vec<(String, String)>,
+    Vec<Vec<TokenID>>,
+) {
     if biases.is_empty() {
         return (HashMap::new(), vec![], vec![]);
     }
@@ -368,7 +695,7 @@ fn build_logit_bias_map(
     let mut bias_map: HashMap<TokenID, f32> = HashMap::new();
     let mut category_token_ids: Vec<Vec<TokenID>> = vec![vec![]; biases.len()];
 
-    for (token, _) in model.tokens(Special::Tokenize) {
+    for (token, _) in model.tokens(true) {
         let vid = token.0 as TokenID;
         let text_v = tokenizer.tokens_to_string(&[vid]);
         if text_v.is_empty() {
@@ -392,4 +719,110 @@ fn build_logit_bias_map(
     }
 
     (bias_map, category_info, category_token_ids)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::token::Canidate;
+
+    #[test]
+    fn force_selects_next_allowed_category_token() {
+        let candidates = Canidates::new(vec![
+            Canidate {
+                token_id: 10,
+                probability: 0.8,
+                logit: 4.0,
+                embedding_logit: 0.0,
+            },
+            Canidate {
+                token_id: 20,
+                probability: 0.2,
+                logit: 1.0,
+                embedding_logit: 0.0,
+            },
+        ]);
+        assert_eq!(forced_token_id(&[20, 30], 0, &candidates), Some(20));
+        assert_eq!(forced_token_id(&[20, 30], 1, &candidates), None);
+    }
+
+    #[test]
+    fn distribution_metrics_report_margin_and_normalized_entropy() {
+        let names = ["a".to_string(), "b".to_string()];
+        let metrics = distribution_metrics([(&names[0], 2.0), (&names[1], 1.0)].into_iter());
+        assert_eq!(metrics.winner_category.as_deref(), Some("a"));
+        assert!((metrics.top_two_margin - 1.0).abs() < f32::EPSILON);
+        assert!(metrics.normalized_entropy > 0.0);
+        assert!(metrics.normalized_entropy < 1.0);
+    }
+
+    #[test]
+    fn force_text_accounts_for_grammar_fast_forward_prefix() {
+        assert_eq!(remaining_force_text("Dosing", "Category: "), "Dosing");
+        assert_eq!(remaining_force_text("Dosing", "Category: Dos"), "ing");
+        assert_eq!(remaining_force_text("Dosing", "Category:"), " Dosing");
+    }
+
+    /// Smoke-test hot SeqState restore across two generations with the same system prompt.
+    /// Requires MODEL_PATH (and enough Metal/CPU memory). Run with:
+    /// `MODEL_PATH=... cargo test -p inference hot_system_kv_reuse -- --ignored --nocapture`
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires a local GGUF via MODEL_PATH"]
+    async fn hot_system_kv_reuse_two_generations() {
+        use crate::grammar::VCmessage;
+        use std::path::PathBuf;
+
+        let model_path = std::env::var("MODEL_PATH").expect("MODEL_PATH");
+        let cache_dir = PathBuf::from(
+            std::env::var("CONTEXT_CACHE_DIR").unwrap_or_else(|_| "context_cache".into()),
+        );
+        let _ = std::fs::create_dir_all(&cache_dir);
+
+        let engine = InferenceEngine::new(InferenceConfig {
+            model_path: PathBuf::from(model_path),
+            context_cache_dir: cache_dir,
+            max_tokens: 32,
+            top_candidate_count: 5,
+        })
+        .expect("load engine");
+
+        let messages = vec![
+            VCmessage {
+                category: "Safety".into(),
+                kind: String::new(),
+                description: "Safety information".into(),
+                mlr_message: "Here is safety info.".into(),
+                message: "Here is safety info.".into(),
+            },
+            VCmessage {
+                category: "Dosing".into(),
+                kind: String::new(),
+                description: "Dosing information".into(),
+                mlr_message: "Here is dosing info.".into(),
+                message: "Here is dosing info.".into(),
+            },
+        ];
+        let grammar = GrammarFlow::new("TestBrand", &messages).expect("grammar");
+
+        for (i, prompt) in ["tell me about safety", "how do I dose this"].iter().enumerate() {
+            let mut rx = engine
+                .generate((*prompt).to_string(), grammar.clone(), vec![])
+                .await;
+            let mut done = false;
+            while let Some(event) = rx.recv().await {
+                match event {
+                    InferenceEvent::Done { full_text, .. } => {
+                        println!("gen {i} ok: {}", full_text.chars().take(80).collect::<String>());
+                        done = true;
+                        break;
+                    }
+                    InferenceEvent::Error { message } => {
+                        panic!("gen {i} failed: {message}");
+                    }
+                    InferenceEvent::Token(_) => {}
+                }
+            }
+            assert!(done, "gen {i} produced no Done event");
+        }
+    }
 }

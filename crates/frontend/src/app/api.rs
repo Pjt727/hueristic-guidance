@@ -64,6 +64,7 @@ pub fn open_sse_stream(
     set_steps: WriteSignal<Vec<StepCandidates>>,
     set_status: WriteSignal<String>,
     set_streaming: WriteSignal<bool>,
+    set_llm_latency_ms: WriteSignal<Option<u64>>,
 ) {
     let url = format!("/infer/stream/{session_id}");
     let es = match EventSource::new(&url) {
@@ -83,7 +84,12 @@ pub fn open_sse_stream(
             Ok(InferenceEvent::Token(step)) => {
                 set_steps.update(|v| v.push(step));
             }
-            Ok(InferenceEvent::Done { .. }) => {
+            Ok(InferenceEvent::Done {
+                latency_ms,
+                category_latency_ms,
+                ..
+            }) => {
+                set_llm_latency_ms.set(Some(category_latency_ms.unwrap_or(latency_ms)));
                 set_status.set("Done".to_string());
                 set_streaming.set(false);
                 es_done.close();
@@ -133,7 +139,9 @@ pub async fn fetch_bulk_test_runs() -> Result<Vec<BulkTestRunSummary>, String> {
     if !resp.ok() {
         return Err(format!("HTTP {}", resp.status()));
     }
-    resp.json::<Vec<BulkTestRunSummary>>().await.map_err(|e| e.to_string())
+    resp.json::<Vec<BulkTestRunSummary>>()
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// GET /bulk-tests/{run_id} — load all results for a past run.
@@ -227,7 +235,9 @@ pub async fn apply_weights(
     if !resp.ok() {
         return Err(format!("HTTP {}", resp.status()));
     }
-    resp.json::<ApplyWeightsResponse>().await.map_err(|e| e.to_string())
+    resp.json::<ApplyWeightsResponse>()
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Response from POST /bulk-tests/{run_id}/apply-weights.
@@ -246,7 +256,9 @@ pub async fn optimize_weights(run_id: i64) -> Result<OptimizeResponse, String> {
     if !resp.ok() {
         return Err(format!("HTTP {}", resp.status()));
     }
-    resp.json::<OptimizeResponse>().await.map_err(|e| e.to_string())
+    resp.json::<OptimizeResponse>()
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Response from POST /bulk-tests/{run_id}/optimize.
@@ -267,6 +279,25 @@ pub struct OptimizeResponse {
     /// Classifier ensemble optimization results.
     #[serde(default)]
     pub ensemble_optimization: Option<EnsembleOptimization>,
+    #[serde(default)]
+    pub routing_metrics: RoutingMetrics,
+}
+
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+pub struct RoutingMetrics {
+    pub examples_analyzed: usize,
+    pub force_gate_count: usize,
+    pub force_gate_rate_pct: f64,
+    pub soft_override_count: usize,
+    pub forced_override_count: usize,
+    pub override_correct: usize,
+    pub override_accuracy_pct: f64,
+    pub forced_correct: usize,
+    pub forced_accuracy_pct: f64,
+    pub raw_correct: usize,
+    pub raw_accuracy_pct: f64,
+    pub final_correct: usize,
+    pub final_accuracy_pct: f64,
 }
 
 /// Accuracy report from the server-side kappa evaluation.
@@ -475,3 +506,217 @@ pub async fn classify_single(
         .collect())
 }
 
+// ---------------------------------------------------------------------------
+// LLM validation loop
+// ---------------------------------------------------------------------------
+
+pub async fn fetch_agent_versions() -> Result<Vec<inference_types::AgentVersionInfo>, String> {
+    let resp = gloo_net::http::Request::get("/agent-versions")
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if !resp.ok() {
+        return Err(format!("HTTP {}", resp.status()));
+    }
+    resp.json().await.map_err(|e| e.to_string())
+}
+
+pub async fn start_llm_validation(
+    agent_id: i32,
+    version_id: i32,
+    classifier_backend: &str,
+) -> Result<String, String> {
+    let body = serde_json::json!({
+        "agent_id": agent_id,
+        "version_id": version_id,
+        "classifier_backend": classifier_backend,
+    });
+    let resp = gloo_net::http::Request::post("/llm-validation")
+        .header("Content-Type", "application/json")
+        .body(body.to_string())
+        .map_err(|e| e.to_string())?
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if !resp.ok() {
+        return Err(format!("HTTP {}", resp.status()));
+    }
+    let json: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+    json["session_id"]
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| "missing session_id".into())
+}
+
+pub async fn decide_llm_validation(session_id: &str, approve: bool) -> Result<String, String> {
+    let body = serde_json::json!({ "approve": approve });
+    let resp = gloo_net::http::Request::post(&format!("/llm-validation/{session_id}/decision"))
+        .header("Content-Type", "application/json")
+        .body(body.to_string())
+        .map_err(|e| e.to_string())?
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if !resp.ok() {
+        return Err(format!("HTTP {}", resp.status()));
+    }
+    let json: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+    json["session_id"]
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| "missing session_id".into())
+}
+
+pub async fn cancel_llm_validation(session_id: &str) -> Result<(), String> {
+    let resp = gloo_net::http::Request::post(&format!("/llm-validation/{session_id}/cancel"))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if !resp.ok() {
+        return Err(format!("HTTP {}", resp.status()));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug)]
+pub struct ProposalState {
+    pub best_round: u32,
+    pub best_accuracy_pct: f64,
+    pub amendments: Vec<inference_types::ValidationAmendment>,
+    pub executive_summary: Option<inference_types::AnalysisExecutiveSummary>,
+}
+
+pub fn open_llm_validation_stream(
+    session_id: String,
+    set_status: WriteSignal<String>,
+    set_running: WriteSignal<bool>,
+    set_rounds: WriteSignal<Vec<inference_types::ValidationRoundSummary>>,
+    set_proposal: WriteSignal<Option<ProposalState>>,
+    set_pending_session: WriteSignal<Option<String>>,
+    decision_session: String,
+) {
+    let url = format!("/llm-validation/stream/{session_id}");
+    let es = match EventSource::new(&url) {
+        Ok(es) => es,
+        Err(e) => {
+            set_status.set(format!("EventSource failed: {:?}", e));
+            set_running.set(false);
+            return;
+        }
+    };
+
+    let es_done = es.clone();
+    let on_message = Closure::<dyn FnMut(MessageEvent)>::new(move |e: MessageEvent| {
+        let data = e.data().as_string().unwrap_or_default();
+        match serde_json::from_str::<inference_types::LlmValidationEvent>(&data) {
+            Ok(inference_types::LlmValidationEvent::Status { message }) => {
+                set_status.set(message);
+            }
+            Ok(inference_types::LlmValidationEvent::RoundStarted { round }) => {
+                set_status.set(format!("Round {round} started…"));
+            }
+            Ok(inference_types::LlmValidationEvent::ExampleResult {
+                round,
+                example_id,
+                success,
+                expected_category,
+                predicted_category,
+                close_top_logits,
+                non_grammar_top_logits,
+            }) => {
+                let mark = if success { "✓" } else { "✗" };
+                let mut flags = String::new();
+                if close_top_logits {
+                    flags.push_str(" [close logits]");
+                }
+                if non_grammar_top_logits {
+                    flags.push_str(" [non-grammar top]");
+                }
+                set_status.set(format!(
+                    "R{round} {mark} #{example_id} expected={expected_category} got={predicted_category:?}{flags}"
+                ));
+            }
+            Ok(inference_types::LlmValidationEvent::RoundCompleted { summary }) => {
+                set_status.set(format!(
+                    "Round {} done: {:.1}% — {} confusion(s)",
+                    summary.round,
+                    summary.accuracy_pct,
+                    summary.confusions.len()
+                ));
+                set_rounds.update(|v| {
+                    if let Some(existing) = v.iter_mut().find(|r| r.round == summary.round) {
+                        *existing = summary;
+                    } else {
+                        v.push(summary);
+                    }
+                });
+            }
+            Ok(inference_types::LlmValidationEvent::Analyzing { confusion_count }) => {
+                set_status.set(format!("Analyzing {confusion_count} confusions with OpenAI…"));
+            }
+            Ok(inference_types::LlmValidationEvent::ProposalReady {
+                best_round,
+                best_accuracy_pct,
+                amendments,
+                rounds,
+                executive_summary,
+            }) => {
+                set_rounds.set(rounds);
+                set_proposal.set(Some(ProposalState {
+                    best_round,
+                    best_accuracy_pct,
+                    amendments,
+                    executive_summary,
+                }));
+                set_pending_session.set(Some(decision_session.clone()));
+                set_status.set(format!(
+                    "Best round {best_round} at {best_accuracy_pct:.1}% — review amendments"
+                ));
+                set_running.set(false);
+                es_done.close();
+            }
+            Ok(inference_types::LlmValidationEvent::Applied { applied_count }) => {
+                set_status.set(format!("Applied {applied_count} amendments to Postgres"));
+            }
+            Ok(inference_types::LlmValidationEvent::DeniedRetest {
+                total,
+                success_count,
+                accuracy_pct,
+            }) => {
+                set_status.set(format!(
+                    "Denied retest: {success_count}/{total} ({accuracy_pct:.1}%)"
+                ));
+                set_proposal.set(None);
+                set_pending_session.set(None);
+            }
+            Ok(inference_types::LlmValidationEvent::Cancelled { message }) => {
+                set_status.set(format!("Cancelled: {message}"));
+                set_running.set(false);
+                set_pending_session.set(None);
+                es_done.close();
+            }
+            Ok(inference_types::LlmValidationEvent::Done) => {
+                set_running.set(false);
+                es_done.close();
+            }
+            Ok(inference_types::LlmValidationEvent::Error { message }) => {
+                set_status.set(format!("Error: {message}"));
+                set_running.set(false);
+                es_done.close();
+            }
+            Err(_) => {}
+        }
+    });
+    es.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
+    on_message.forget();
+
+    let es_err = es.clone();
+    let on_error = Closure::<dyn FnMut(web_sys::Event)>::new(move |_e| {
+        set_status.set("SSE connection error".into());
+        set_running.set(false);
+        es_err.close();
+    });
+    es.set_onerror(Some(on_error.as_ref().unchecked_ref()));
+    on_error.forget();
+    std::mem::forget(es);
+}

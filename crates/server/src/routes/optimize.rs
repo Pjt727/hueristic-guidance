@@ -6,7 +6,9 @@ use axum::{
     http::StatusCode,
 };
 use classifiers::calibration;
-use inference_types::{CategoryTopToken, ClassifierMethodResult};
+use inference_types::{
+    BiasRegime, CategoryTopToken, ClassifierMethodResult, DecisionDiagnostics, OverrideOutcome,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::db;
@@ -41,12 +43,10 @@ pub async fn apply_weights(
     Json(body): Json<ApplyWeightsRequest>,
 ) -> Result<Json<ApplyWeightsResponse>, StatusCode> {
     // Look up which agent this run belongs to.
-    let agent_id = db::get_run_agent_id(&state.db, run_id)
-        .await
-        .map_err(|e| {
-            tracing::error!(run_id, error = %e, "failed to get agent_id for run");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    let agent_id = db::get_run_agent_id(&state.db, run_id).await.map_err(|e| {
+        tracing::error!(run_id, error = %e, "failed to get agent_id for run");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
     // Load all VC messages for this agent to build category → message_ids.
     let messages = db::load_vc_messages_with_ids(&state.vc_db, agent_id as i32)
@@ -94,7 +94,10 @@ pub async fn apply_weights(
         "applied optimised kappa values"
     );
 
-    Ok(Json(ApplyWeightsResponse { updated, unmatched_categories }))
+    Ok(Json(ApplyWeightsResponse {
+        updated,
+        unmatched_categories,
+    }))
 }
 
 // Re-use the SlimStep definition from bulk_test (private there), so we
@@ -104,6 +107,25 @@ struct SlimStep {
     #[allow(dead_code)]
     chosen: inference_types::TokenWithProb,
     category_top_tokens: Vec<CategoryTopToken>,
+    #[serde(default)]
+    decision_diagnostics: Option<DecisionDiagnostics>,
+}
+
+#[derive(Debug, Default, Serialize)]
+pub struct RoutingMetrics {
+    pub examples_analyzed: usize,
+    pub force_gate_count: usize,
+    pub force_gate_rate_pct: f64,
+    pub soft_override_count: usize,
+    pub forced_override_count: usize,
+    pub override_correct: usize,
+    pub override_accuracy_pct: f64,
+    pub forced_correct: usize,
+    pub forced_accuracy_pct: f64,
+    pub raw_correct: usize,
+    pub raw_accuracy_pct: f64,
+    pub final_correct: usize,
+    pub final_accuracy_pct: f64,
 }
 
 /// Response body for POST /bulk-tests/{run_id}/optimize
@@ -123,6 +145,8 @@ pub struct OptimizeResponse {
     pub optimized_accuracy: optimize::AccuracyReport,
     /// Classifier ensemble optimization results (TF-IDF vs embedding weights).
     pub ensemble_optimization: Option<calibration::OptimizationResult>,
+    /// Effectiveness of embedding routing versus the raw LLM winner.
+    pub routing_metrics: RoutingMetrics,
 }
 
 /// POST /bulk-tests/{run_id}/optimize
@@ -154,6 +178,7 @@ pub async fn optimize_weights(
     let mut examples_skipped = 0usize;
     let mut example_data: Vec<ExampleData> = Vec::with_capacity(rows.len());
     let mut calibration_examples: Vec<calibration::ExampleScores> = Vec::with_capacity(rows.len());
+    let mut routing_metrics = RoutingMetrics::default();
 
     for row in &rows {
         // Parse correct categories.
@@ -191,6 +216,36 @@ pub async fn optimize_weights(
                 continue;
             }
         };
+        let has_decision_diagnostics = scored_step.decision_diagnostics.is_some();
+
+        if let Some(diagnostics) = &scored_step.decision_diagnostics {
+            routing_metrics.examples_analyzed += 1;
+            if diagnostics.bias_regime == BiasRegime::Force {
+                routing_metrics.force_gate_count += 1;
+                if row.success {
+                    routing_metrics.forced_correct += 1;
+                }
+            }
+            match diagnostics.override_outcome {
+                OverrideOutcome::SoftBias => routing_metrics.soft_override_count += 1,
+                OverrideOutcome::ForcedEmbedding => routing_metrics.forced_override_count += 1,
+                OverrideOutcome::None => {}
+            }
+            if diagnostics.override_outcome != OverrideOutcome::None && row.success {
+                routing_metrics.override_correct += 1;
+            }
+            if diagnostics
+                .pre_bias
+                .winner_category
+                .as_ref()
+                .is_some_and(|winner| correct_categories.contains(winner))
+            {
+                routing_metrics.raw_correct += 1;
+            }
+            if row.success {
+                routing_metrics.final_correct += 1;
+            }
+        }
 
         let category_scores: HashMap<String, CategoryScore> = scored_step
             .category_top_tokens
@@ -199,20 +254,36 @@ pub async fn optimize_weights(
                 (
                     ct.category_name.clone(),
                     CategoryScore {
-                        logit: ct.best_token.logit,
+                        logit: if has_decision_diagnostics {
+                            ct.pre_bias_logit
+                        } else {
+                            ct.best_token.logit
+                        },
                         sim_score: ct.sim_score,
+                        positive_similarity: ct.positive_similarity,
+                        force_target: scored_step
+                            .decision_diagnostics
+                            .as_ref()
+                            .and_then(|diagnostics| diagnostics.force_target.as_ref())
+                            == Some(&ct.category_name),
                     },
                 )
             })
             .collect();
 
-        // Build LLM logit map for calibration.
+        // Build an unbiased LLM logit map for calibration.
         let llm_logits: HashMap<String, f32> = scored_step
             .category_top_tokens
             .iter()
             .map(|ct| {
-                let adjusted = ct.best_token.logit + ct.best_token.embedding_logit;
-                (ct.category_name.clone(), adjusted)
+                (
+                    ct.category_name.clone(),
+                    if has_decision_diagnostics {
+                        ct.pre_bias_logit
+                    } else {
+                        ct.best_token.logit
+                    },
+                )
             })
             .collect();
 
@@ -293,6 +364,7 @@ pub async fn optimize_weights(
     } else {
         None
     };
+    finalize_routing_metrics(&mut routing_metrics);
 
     Ok(Json(OptimizeResponse {
         weights,
@@ -302,5 +374,57 @@ pub async fn optimize_weights(
         no_embedding_accuracy,
         optimized_accuracy,
         ensemble_optimization,
+        routing_metrics,
     }))
+}
+
+fn percent(numerator: usize, denominator: usize) -> f64 {
+    if denominator == 0 {
+        0.0
+    } else {
+        numerator as f64 / denominator as f64 * 100.0
+    }
+}
+
+fn finalize_routing_metrics(metrics: &mut RoutingMetrics) {
+    metrics.force_gate_rate_pct = percent(metrics.force_gate_count, metrics.examples_analyzed);
+    let override_count = metrics.soft_override_count + metrics.forced_override_count;
+    metrics.override_accuracy_pct = percent(metrics.override_correct, override_count);
+    metrics.forced_accuracy_pct = percent(metrics.forced_correct, metrics.force_gate_count);
+    metrics.raw_accuracy_pct = percent(metrics.raw_correct, metrics.examples_analyzed);
+    metrics.final_accuracy_pct = percent(metrics.final_correct, metrics.examples_analyzed);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn routing_percentages_use_their_correct_denominators() {
+        let mut metrics = RoutingMetrics {
+            examples_analyzed: 10,
+            force_gate_count: 4,
+            soft_override_count: 2,
+            forced_override_count: 2,
+            override_correct: 3,
+            forced_correct: 3,
+            raw_correct: 6,
+            final_correct: 8,
+            ..RoutingMetrics::default()
+        };
+        finalize_routing_metrics(&mut metrics);
+        assert_eq!(metrics.force_gate_rate_pct, 40.0);
+        assert_eq!(metrics.override_accuracy_pct, 75.0);
+        assert_eq!(metrics.forced_accuracy_pct, 75.0);
+        assert_eq!(metrics.raw_accuracy_pct, 60.0);
+        assert_eq!(metrics.final_accuracy_pct, 80.0);
+    }
+
+    #[test]
+    fn empty_routing_metrics_do_not_produce_nan() {
+        let mut metrics = RoutingMetrics::default();
+        finalize_routing_metrics(&mut metrics);
+        assert_eq!(metrics.override_accuracy_pct, 0.0);
+        assert_eq!(metrics.force_gate_rate_pct, 0.0);
+    }
 }

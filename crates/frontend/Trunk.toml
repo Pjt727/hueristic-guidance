@@ -29,3 +29,11 @@ rewrite = "/classify"
 [[proxy]]
 backend = "http://localhost:3000/classify/methods"
 rewrite = "/classify/methods"
+
+[[proxy]]
+backend = "http://localhost:3000/agent-versions"
+rewrite = "/agent-versions"
+
+[[proxy]]
+backend = "http://localhost:3000/llm-validation"
+rewrite = "/llm-validation"

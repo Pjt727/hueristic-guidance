@@ -10,7 +10,10 @@ use axum::{
 };
 use classifiers::{CategoryDef, Classifier};
 use inference::{CategoryBias, GrammarFlow, InferenceEvent};
-use inference_types::{BulkTestEvent, CategoryTopToken, ClassifierMethodResult, ClassifierScore, StepCandidates, TokenWithProb};
+use inference_types::{
+    BulkTestEvent, CategoryTopToken, ClassifierMethodResult, ClassifierScore, DecisionDiagnostics,
+    StepCandidates, TokenWithProb,
+};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt as _;
@@ -30,6 +33,8 @@ const EMBEDDING_BATCH_SIZE: usize = 20;
 struct SlimStep {
     chosen: TokenWithProb,
     category_top_tokens: Vec<CategoryTopToken>,
+    #[serde(default)]
+    decision_diagnostics: Option<DecisionDiagnostics>,
 }
 
 impl SlimStep {
@@ -37,6 +42,7 @@ impl SlimStep {
         Self {
             chosen: s.chosen.clone(),
             category_top_tokens: s.category_top_tokens.clone(),
+            decision_diagnostics: s.decision_diagnostics.clone(),
         }
     }
 
@@ -46,6 +52,7 @@ impl SlimStep {
             top_alternatives: vec![],
             top_constrained: vec![],
             category_top_tokens: self.category_top_tokens,
+            decision_diagnostics: self.decision_diagnostics,
         }
     }
 }
@@ -105,9 +112,7 @@ pub async fn start_bulk_test(
         })
         .collect();
 
-    let mut standalone_classifiers: Vec<Arc<dyn Classifier>> = vec![
-        Arc::new(classifiers::tfidf::TfIdfClassifier::new(&categories_for_classifiers)),
-    ];
+    let mut standalone_classifiers: Vec<Arc<dyn Classifier>> = vec![];
     if let Ok(api_key) = std::env::var("OPENAI_API_KEY") {
         match classifiers::openai_embedding::OpenAiEmbeddingClassifier::new(
             api_key,
@@ -116,13 +121,7 @@ pub async fn start_bulk_test(
         .await
         {
             Ok(c) => {
-                let openai_clf: Arc<dyn Classifier> = Arc::new(c);
-                let ensemble = classifiers::ensemble::EnsembleClassifier::equal_weight(vec![
-                    standalone_classifiers[0].clone(),
-                    openai_clf.clone(),
-                ]);
-                standalone_classifiers.push(openai_clf);
-                standalone_classifiers.push(Arc::new(ensemble));
+                standalone_classifiers.push(Arc::new(c));
             }
             Err(e) => {
                 tracing::warn!(error = %e, "OpenAI embedding init failed for bulk test");
@@ -190,7 +189,10 @@ pub async fn start_bulk_test(
     }
 
     if examples.is_empty() {
-        tracing::warn!(agent_id, "no HCP examples with expected categories — nothing to test");
+        tracing::warn!(
+            agent_id,
+            "no HCP examples with expected categories — nothing to test"
+        );
         return Err(StatusCode::BAD_REQUEST);
     }
 
@@ -253,13 +255,8 @@ pub async fn start_bulk_test(
             let category_biases = if embedding_vec.is_empty() {
                 vec![]
             } else {
-                compute_category_biases_from_embedding(
-                    &vc_db,
-                    &sqlite_db,
-                    &embedding_vec,
-                    agent_id,
-                )
-                .await
+                compute_category_biases_from_embedding(&vc_db, &sqlite_db, &embedding_vec, agent_id)
+                    .await
             };
 
             // Run inference — creates one LlamaContext, awaits completion, then drops it.
@@ -273,7 +270,11 @@ pub async fn start_bulk_test(
             while let Some(event) = infer_rx.recv().await {
                 match event {
                     InferenceEvent::Token(step) => steps.push(step),
-                    InferenceEvent::Done { full_text: ft } => {
+                    InferenceEvent::Done {
+                        full_text: ft,
+                        latency_ms: _,
+                        category_latency_ms: _,
+                    } => {
                         full_text = Some(ft);
                         break;
                     }
@@ -290,6 +291,10 @@ pub async fn start_bulk_test(
 
             // Determine the chosen category and whether this is a success.
             //
+            // Prefer parsing Done.full_text. Fall back to the decision-step
+            // category table when decode/prefix matching fails (e.g. older
+            // runs that stored "Invalid utf-8" token pieces).
+            //
             // full_output may start with:
             //   " {name}\n\n{message}"  — when process_prompt() forces "Category: "
             //   "Category: {name}\n\n{message}"  — when the prefix is not forced
@@ -298,47 +303,32 @@ pub async fn start_bulk_test(
             // then use longest-match.  No "\n\n" suffix check is needed because
             // longest-match already prevents false-positive prefix matches
             // (e.g. "Safety" vs "Safety Information").
-            let (chosen_category, success) = match &full_text {
-                None => (None, false),
-                Some(ft) => {
-                    let ft_norm = {
-                        let s = ft.trim_start();
-                        let s = s.strip_prefix("Category:").unwrap_or(s);
-                        s.trim_start()
-                    };
-                    tracing::debug!(
+            let chosen_category = full_text
+                .as_deref()
+                .and_then(|ft| match_category_prefix(ft, &category_to_id))
+                .or_else(|| chosen_category_from_steps(&steps));
+
+            if chosen_category.is_none() {
+                if let Some(ft) = &full_text {
+                    tracing::warn!(
                         example_id = example.id,
                         full_text_prefix = %&ft.chars().take(80).collect::<String>(),
-                        normalized_prefix = %&ft_norm.chars().take(80).collect::<String>(),
-                        "bulk test full_text prefix"
+                        categories = ?category_to_id.keys().collect::<Vec<_>>(),
+                        "no category matched full_text prefix or decision steps"
                     );
-                    let cat = category_to_id
-                        .keys()
-                        .filter(|name| ft_norm.starts_with(name.as_str()))
-                        .max_by_key(|name| name.len())
-                        .cloned();
-                    if cat.is_none() {
-                        tracing::warn!(
-                            example_id = example.id,
-                            full_text_prefix = %&ft.chars().take(80).collect::<String>(),
-                            normalized_prefix = %&ft_norm.chars().take(80).collect::<String>(),
-                            categories = ?category_to_id.keys().collect::<Vec<_>>(),
-                            "no category matched full_text prefix"
-                        );
-                    }
-                    let chosen_id = cat
-                        .as_deref()
-                        .and_then(|c| category_to_id.get(c))
-                        .copied();
-                    let ok = match chosen_id {
-                        None => false,
-                        Some(id) => correct_answers
-                            .get(&example.id)
-                            .map(|ids| ids.contains(&id))
-                            .unwrap_or(false),
-                    };
-                    (cat, ok)
                 }
+            }
+
+            let success = match chosen_category
+                .as_deref()
+                .and_then(|c| category_to_id.get(c))
+                .copied()
+            {
+                None => false,
+                Some(id) => correct_answers
+                    .get(&example.id)
+                    .map(|ids| ids.contains(&id))
+                    .unwrap_or(false),
             };
 
             let correct_categories: Vec<String> = correct_answers
@@ -354,7 +344,10 @@ pub async fn start_bulk_test(
             // Run standalone classifiers on the example text.
             let mut classifier_results_vec: Vec<ClassifierMethodResult> = vec![];
             for clf in standalone_classifiers.iter() {
-                match clf.classify(&example.text, &categories_for_classifiers, None).await {
+                match clf
+                    .classify(&example.text, &categories_for_classifiers, None)
+                    .await
+                {
                     Ok(result) => {
                         classifier_results_vec.push(ClassifierMethodResult {
                             method_name: result.method_name,
@@ -443,7 +436,39 @@ pub async fn start_bulk_test(
         }
     });
 
-    Ok(Json(BulkTestResponse { bulk_test_id, run_id }))
+    Ok(Json(BulkTestResponse {
+        bulk_test_id,
+        run_id,
+    }))
+}
+
+fn match_category_prefix(
+    full_text: &str,
+    category_to_id: &HashMap<String, i32>,
+) -> Option<String> {
+    let ft_norm = {
+        let s = full_text.trim_start();
+        let s = s.strip_prefix("Category:").unwrap_or(s);
+        s.trim_start()
+    };
+    category_to_id
+        .keys()
+        .filter(|name| ft_norm.starts_with(name.as_str()))
+        .max_by_key(|name| name.len())
+        .cloned()
+}
+
+fn chosen_category_from_steps(steps: &[StepCandidates]) -> Option<String> {
+    let step = steps.iter().find(|s| !s.category_top_tokens.is_empty())?;
+    if let Some(diagnostics) = &step.decision_diagnostics
+        && let Some(winner) = diagnostics.post_bias.winner_category.as_ref()
+    {
+        return Some(winner.clone());
+    }
+    step.category_top_tokens
+        .iter()
+        .max_by(|a, b| a.post_bias_logit.total_cmp(&b.post_bias_logit))
+        .map(|category| category.category_name.clone())
 }
 
 /// Compute per-category embedding biases from a pre-fetched embedding vector.
@@ -463,18 +488,7 @@ async fn compute_category_biases_from_embedding(
         }
     };
 
-    let mut biases = Vec::with_capacity(margins.len());
-    for m in &margins {
-        let kappa = db::get_or_create_kappa(sqlite_db, m.message_id)
-            .await
-            .unwrap_or(10.0);
-        biases.push(CategoryBias {
-            category_name: m.category_name.clone(),
-            weighted_margin: (kappa * m.margin) as f32,
-            sim_score: m.margin as f32,
-        });
-    }
-    biases
+    crate::category_biases::assemble(sqlite_db, &margins).await
 }
 
 /// GET /bulk-test/stream/:bulk_test_id
@@ -537,10 +551,13 @@ pub async fn stream_bulk_test_sse(
 pub async fn list_bulk_tests(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<db::BulkTestRunSummary>>, StatusCode> {
-    db::list_bulk_test_runs(&state.db).await.map(Json).map_err(|e| {
-        tracing::error!(error = %e, "failed to list bulk test runs");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })
+    db::list_bulk_test_runs(&state.db)
+        .await
+        .map(Json)
+        .map_err(|e| {
+            tracing::error!(error = %e, "failed to list bulk test runs");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
 }
 
 /// One result row as returned by GET /bulk-tests/{run_id}.
@@ -562,10 +579,12 @@ pub async fn get_bulk_test(
     Path(run_id): Path<i64>,
     State(state): State<AppState>,
 ) -> Result<Json<Vec<StoredTestResult>>, StatusCode> {
-    let rows = db::load_bulk_test_results(&state.db, run_id).await.map_err(|e| {
-        tracing::error!(run_id, error = %e, "failed to load bulk test results");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    let rows = db::load_bulk_test_results(&state.db, run_id)
+        .await
+        .map_err(|e| {
+            tracing::error!(run_id, error = %e, "failed to load bulk test results");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
     let results = rows
         .into_iter()

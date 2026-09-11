@@ -4,12 +4,15 @@ pub mod components;
 use inference_types::{ClassifierMethodResult, StepCandidates};
 use leptos::prelude::*;
 
-use components::{AgentSelector, BulkTestPage, CandidatePanel, PromptInput, TokenStreamView};
+use components::{
+    AgentSelector, BulkTestPage, CandidatePanel, LlmValidationPage, PromptInput, TokenStreamView,
+};
 
 #[derive(Clone, Copy, PartialEq)]
 enum Page {
     Inference,
     BulkTest,
+    LlmValidation,
 }
 
 #[component]
@@ -32,6 +35,12 @@ pub fn App() -> impl IntoView {
                 >
                     "Bulk Test"
                 </button>
+                <button
+                    class=move || if page.get() == Page::LlmValidation { "btn-active" } else { "" }
+                    on:click=move |_| set_page.set(Page::LlmValidation)
+                >
+                    "LLM Validation"
+                </button>
             </nav>
 
             <Show when=move || page.get() == Page::Inference>
@@ -39,6 +48,9 @@ pub fn App() -> impl IntoView {
             </Show>
             <Show when=move || page.get() == Page::BulkTest>
                 <BulkTestPage />
+            </Show>
+            <Show when=move || page.get() == Page::LlmValidation>
+                <LlmValidationPage />
             </Show>
         </div>
     }
@@ -52,6 +64,7 @@ fn InferencePage() -> impl IntoView {
     let (streaming, set_streaming) = signal(false);
     let (steps, set_steps) = signal::<Vec<StepCandidates>>(vec![]);
     let (selected_idx, set_selected_idx) = signal::<Option<usize>>(None);
+    let (llm_latency_ms, set_llm_latency_ms) = signal::<Option<u64>>(None);
 
     // Classifier state
     let (classifier_methods, set_classifier_methods) = signal::<Vec<String>>(vec![]);
@@ -79,6 +92,7 @@ fn InferencePage() -> impl IntoView {
         set_steps.set(vec![]);
         set_selected_idx.set(None);
         set_classifier_results.set(vec![]);
+        set_llm_latency_ms.set(None);
         set_status.set("Starting…".to_string());
         set_streaming.set(true);
 
@@ -87,7 +101,13 @@ fn InferencePage() -> impl IntoView {
             match api::start_inference(p, aid).await {
                 Ok(session_id) => {
                     set_status.set(format!("Streaming {session_id}"));
-                    api::open_sse_stream(session_id, set_steps, set_status, set_streaming);
+                    api::open_sse_stream(
+                        session_id,
+                        set_steps,
+                        set_status,
+                        set_streaming,
+                        set_llm_latency_ms,
+                    );
                 }
                 Err(e) => {
                     set_status.set(format!("Error: {e}"));
@@ -184,6 +204,7 @@ fn InferencePage() -> impl IntoView {
                     let mut results = classifier_results.get();
 
                     // Build LLM row from the first decision step (non-empty category_top_tokens)
+                    let llm_latency = llm_latency_ms.get();
                     let llm_row: Option<ClassifierMethodResult> = steps.get()
                         .iter()
                         .find(|s| !s.category_top_tokens.is_empty())
@@ -223,7 +244,7 @@ fn InferencePage() -> impl IntoView {
                                 method_name: "llm".to_string(),
                                 chosen_category: chosen,
                                 confidence: confidence as f64,
-                                latency_ms: 0,
+                                latency_ms: llm_latency.unwrap_or(0),
                                 scores,
                             })
                         });
@@ -265,8 +286,8 @@ fn InferencePage() -> impl IntoView {
                                             cell_style_base.to_string()
                                         };
                                         let conf_pct = format!("{:.1}%", r.confidence * 100.0);
-                                        let latency = if r.method_name == "llm" {
-                                            "—".to_string()
+                                        let latency = if r.method_name == "llm" && r.latency_ms == 0 {
+                                            "…".to_string()
                                         } else {
                                             r.latency_ms.to_string()
                                         };

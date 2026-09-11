@@ -8,9 +8,7 @@ use axum::{
 };
 use classifiers::{
     CategoryDef, ClassificationResult, Classifier, ConversationContext,
-    ensemble::EnsembleClassifier,
     openai_embedding::OpenAiEmbeddingClassifier,
-    tfidf::TfIdfClassifier,
 };
 use serde::{Deserialize, Serialize};
 
@@ -95,10 +93,6 @@ async fn build_classifiers_for_agent(
 
     let mut classifiers: Vec<Arc<dyn Classifier>> = vec![];
 
-    // TF-IDF — always available
-    let tfidf = Arc::new(TfIdfClassifier::new(&categories));
-    classifiers.push(tfidf);
-
     // OpenAI embedding — if API key is set
     if let Ok(api_key) = std::env::var("OPENAI_API_KEY") {
         match OpenAiEmbeddingClassifier::new(api_key, &categories).await {
@@ -107,12 +101,6 @@ async fn build_classifiers_for_agent(
                 tracing::warn!(error = %e, "failed to initialize OpenAI embedding classifier");
             }
         }
-    }
-
-    // Ensemble — wraps whatever classifiers are available (if > 1)
-    if classifiers.len() > 1 {
-        let ensemble = EnsembleClassifier::equal_weight(classifiers.clone());
-        classifiers.push(Arc::new(ensemble));
     }
 
     Ok((classifiers, categories))
@@ -124,10 +112,9 @@ async fn build_classifiers_for_agent(
 
 /// Returns the names of classifier methods available on this server instance.
 pub async fn list_methods() -> Json<Vec<&'static str>> {
-    let mut methods = vec!["tfidf"];
+    let mut methods = vec![];
     if std::env::var("OPENAI_API_KEY").is_ok() {
         methods.push("openai_embedding");
-        methods.push("ensemble");
     }
     Json(methods)
 }

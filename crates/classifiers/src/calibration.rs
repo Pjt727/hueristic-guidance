@@ -93,23 +93,30 @@ pub struct OptimizationResult {
 /// Run the full optimization pipeline on a set of example scores.
 pub fn optimize(examples: &[ExampleScores]) -> OptimizationResult {
     let total = examples.len();
+    let has_tfidf = examples.iter().any(|ex| !ex.tfidf_scores.is_empty());
+    let has_embed = examples.iter().any(|ex| !ex.embedding_scores.is_empty());
 
-    // Baseline accuracy for each standalone method.
-    let tfidf_correct = count_correct(examples, |ex| &ex.tfidf_scores);
-    let embed_correct = count_correct(examples, |ex| &ex.embedding_scores);
-
+    // Baseline accuracy for each standalone method that has data.
     let mut baseline_accuracy = HashMap::new();
-    baseline_accuracy.insert(
-        "tfidf".to_string(),
-        pct(tfidf_correct, total),
-    );
-    baseline_accuracy.insert(
-        "openai_embedding".to_string(),
-        pct(embed_correct, total),
-    );
+    if has_tfidf {
+        baseline_accuracy.insert(
+            "tfidf".to_string(),
+            pct(count_correct(examples, |ex| &ex.tfidf_scores), total),
+        );
+    }
+    if has_embed {
+        baseline_accuracy.insert(
+            "openai_embedding".to_string(),
+            pct(count_correct(examples, |ex| &ex.embedding_scores), total),
+        );
+    }
 
-    // 1. Weight grid search.
-    let weight_search = weight_grid_search(examples, 21); // 0.00, 0.05, ..., 1.00
+    // 1. Weight grid search (only meaningful when both methods have scores).
+    let weight_search = if has_tfidf && has_embed {
+        weight_grid_search(examples, 21) // 0.00, 0.05, ..., 1.00
+    } else {
+        vec![]
+    };
     let optimal_weights = weight_search
         .iter()
         .max_by(|a, b| {
@@ -119,18 +126,33 @@ pub fn optimize(examples: &[ExampleScores]) -> OptimizationResult {
         })
         .cloned()
         .unwrap_or(WeightPoint {
-            tfidf_weight: 0.5,
-            embedding_weight: 0.5,
-            correct: 0,
+            tfidf_weight: if has_tfidf { 0.5 } else { 0.0 },
+            embedding_weight: if has_embed { 1.0 } else { 0.0 },
+            correct: if has_embed {
+                count_correct(examples, |ex| &ex.embedding_scores)
+            } else {
+                0
+            },
             total,
-            accuracy_pct: 0.0,
+            accuracy_pct: if has_embed {
+                pct(count_correct(examples, |ex| &ex.embedding_scores), total)
+            } else {
+                0.0
+            },
         });
 
-    // 2. Embedding temperature search — tests softmax(embed/T) + TF-IDF ensemble.
-    // Small T amplifies tiny embedding score differences; large T flattens them.
-    let temperature_search = temperature_grid_search(examples, &[
-        0.0001, 0.0005, 0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0,
-    ]);
+    // 2. Embedding temperature search.
+    let temperature_search = if has_embed {
+        temperature_grid_search(
+            examples,
+            has_tfidf,
+            &[
+                0.0001, 0.0005, 0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0,
+            ],
+        )
+    } else {
+        vec![]
+    };
     let optimal_temperature = temperature_search
         .iter()
         .max_by(|a, b| {
@@ -251,13 +273,11 @@ fn combine_scores(
     combined
 }
 
-/// Search over different softmax temperatures for embedding scores combined
-/// with equal-weight TF-IDF. Temperature-scaled embedding scores are
-/// `softmax(raw / T)`, which changes the score magnitudes before ensemble
-/// combination — unlike raw scores where the tight clustering makes the
-/// embedding signal negligible.
+/// Search over different softmax temperatures for embedding scores.
+/// When TF-IDF scores are present, combines with equal-weight TF-IDF after scaling.
 fn temperature_grid_search(
     examples: &[ExampleScores],
+    include_tfidf: bool,
     temperatures: &[f64],
 ) -> Vec<TemperaturePoint> {
     let total = examples.len();
@@ -267,10 +287,12 @@ fn temperature_grid_search(
             let correct = examples
                 .iter()
                 .filter(|ex| {
-                    // Apply softmax(embedding_scores / T), then equal-weight
-                    // ensemble with raw TF-IDF scores.
                     let scaled_embed = softmax_scale(&ex.embedding_scores, temp);
-                    let combined = combine_with_tfidf(&ex.tfidf_scores, &scaled_embed, 0.5, 0.5);
+                    let combined = if include_tfidf {
+                        combine_with_tfidf(&ex.tfidf_scores, &scaled_embed, 0.5, 0.5)
+                    } else {
+                        scaled_embed
+                    };
                     let chosen = combined
                         .iter()
                         .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))

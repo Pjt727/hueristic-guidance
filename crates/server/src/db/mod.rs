@@ -135,13 +135,10 @@ pub async fn set_kappa(db: &SqlitePool, message_id: i64, kappa: f64) -> anyhow::
 
 /// Return the agent_id stored in a bulk_test_run row.
 pub async fn get_run_agent_id(db: &SqlitePool, run_id: i64) -> anyhow::Result<i64> {
-    let row = sqlx::query!(
-        "SELECT agent_id FROM bulk_test_runs WHERE id = ?",
-        run_id,
-    )
-    .fetch_one(db)
-    .await
-    .context("failed to fetch agent_id for run")?;
+    let row = sqlx::query!("SELECT agent_id FROM bulk_test_runs WHERE id = ?", run_id,)
+        .fetch_one(db)
+        .await
+        .context("failed to fetch agent_id for run")?;
     Ok(row.agent_id)
 }
 
@@ -174,23 +171,30 @@ pub async fn list_agents(vc_db: &PgPool) -> anyhow::Result<Vec<inference_types::
     let rows = sqlx::query_as::<_, Row>(
         r#"SELECT DISTINCT v.agentid, a.agentname
            FROM vcmessages v
-           JOIN vcembeddingmessages em ON em.messageid = v.id
            LEFT JOIN vcagents a ON a.id = v.agentid
            WHERE v.textcontent IS NOT NULL
              AND v.categoryname IS NOT NULL
              AND v.categoryname != 'conversation_flow'
              AND v.textcontent NOT LIKE '%{{conversation_flow}}%'
              AND v.textcontent != 'N/A'
+             AND (
+               EXISTS (SELECT 1 FROM vcembeddingmessages em WHERE em.messageid = v.id)
+               OR EXISTS (SELECT 1 FROM vcllmmessages lm WHERE lm.messageid = v.id)
+             )
            ORDER BY v.agentid"#,
     )
     .fetch_all(vc_db)
     .await
-    .with_context(|| "failed to list agents — check VCagents/VCmessages/VCembeddingmessages join")?;
+    .with_context(
+        || "failed to list agents — check VCagents/VCmessages/(VCembeddingmessages|VCllmMessages) join",
+    )?;
 
     Ok(rows
         .into_iter()
         .map(|r| inference_types::AgentInfo {
-            name: r.agentname.unwrap_or_else(|| format!("Agent {}", r.agentid)),
+            name: r
+                .agentname
+                .unwrap_or_else(|| format!("Agent {}", r.agentid)),
             id: r.agentid,
         })
         .collect())
@@ -198,20 +202,20 @@ pub async fn list_agents(vc_db: &PgPool) -> anyhow::Result<Vec<inference_types::
 
 /// Load approved VC messages for a given agent from the marketing Postgres DB.
 /// Filters out placeholder-only rows and cleans `{{conversation_continuer}}` tags.
-pub async fn load_vc_messages(
-    vc_db: &PgPool,
-    agent_id: i32,
-) -> anyhow::Result<Vec<VCmessage>> {
+pub async fn load_vc_messages(vc_db: &PgPool, agent_id: i32) -> anyhow::Result<Vec<VCmessage>> {
     let rows = sqlx::query_as::<_, VcMessageRow>(
         r#"SELECT v.categoryname, v.categorydescription, v.textcontent
            FROM vcmessages v
-           JOIN vcembeddingmessages em ON em.messageid = v.id
            WHERE v.agentid      = $1
              AND v.textcontent  IS NOT NULL
              AND v.categoryname IS NOT NULL
              AND v.categoryname != 'conversation_flow'
              AND v.textcontent NOT LIKE '%{{conversation_flow}}%'
-             AND v.textcontent  != 'N/A'"#,
+             AND v.textcontent  != 'N/A'
+             AND (
+               EXISTS (SELECT 1 FROM vcembeddingmessages em WHERE em.messageid = v.id)
+               OR EXISTS (SELECT 1 FROM vcllmmessages lm WHERE lm.messageid = v.id)
+             )"#,
     )
     .bind(agent_id)
     .fetch_all(vc_db)
@@ -222,11 +226,7 @@ pub async fn load_vc_messages(
         .into_iter()
         .filter_map(|r| {
             let category = r.categoryname?.trim().to_string();
-            let description = r
-                .categorydescription
-                .unwrap_or_default()
-                .trim()
-                .to_string();
+            let description = r.categorydescription.unwrap_or_default().trim().to_string();
             let raw_text = r.textcontent?;
             let message = raw_text
                 .replace("{{conversation_continuer}}", "")
@@ -245,7 +245,10 @@ pub async fn load_vc_messages(
         })
         .collect();
 
-    anyhow::ensure!(!messages.is_empty(), "no valid VC messages found for agent {agent_id}");
+    anyhow::ensure!(
+        !messages.is_empty(),
+        "no valid VC messages found for agent {agent_id}"
+    );
     Ok(messages)
 }
 
@@ -254,12 +257,14 @@ pub async fn load_vc_messages(
 // ---------------------------------------------------------------------------
 
 /// One HCP example message used as a test prompt.
+#[derive(Clone)]
 pub struct HcpExample {
     pub id: i32,
     pub text: String,
 }
 
 /// A VC message with its Postgres primary key.
+#[derive(Clone)]
 pub struct VcMessageWithId {
     pub id: i32,
     pub vc_message: VCmessage,
@@ -351,13 +356,16 @@ pub async fn load_vc_messages_with_ids(
     let rows = sqlx::query_as::<_, Row>(
         r#"SELECT v.id, v.categoryname, v.categorydescription, v.textcontent
            FROM vcmessages v
-           JOIN vcembeddingmessages em ON em.messageid = v.id
            WHERE v.agentid      = $1
              AND v.textcontent  IS NOT NULL
              AND v.categoryname IS NOT NULL
              AND v.categoryname != 'conversation_flow'
              AND v.textcontent NOT LIKE '%{{conversation_flow}}%'
-             AND v.textcontent  != 'N/A'"#,
+             AND v.textcontent  != 'N/A'
+             AND (
+               EXISTS (SELECT 1 FROM vcembeddingmessages em WHERE em.messageid = v.id)
+               OR EXISTS (SELECT 1 FROM vcllmmessages lm WHERE lm.messageid = v.id)
+             )"#,
     )
     .bind(agent_id)
     .fetch_all(vc_db)
@@ -402,13 +410,10 @@ pub async fn load_vc_messages_with_ids(
 /// Create a new bulk test run row and return its SQLite row ID.
 pub async fn create_bulk_test_run(db: &SqlitePool, agent_id: i32) -> anyhow::Result<i64> {
     let aid = agent_id as i64;
-    let result = sqlx::query!(
-        "INSERT INTO bulk_test_runs (agent_id) VALUES (?)",
-        aid,
-    )
-    .execute(db)
-    .await
-    .context("failed to insert bulk_test_run")?;
+    let result = sqlx::query!("INSERT INTO bulk_test_runs (agent_id) VALUES (?)", aid,)
+        .execute(db)
+        .await
+        .context("failed to insert bulk_test_run")?;
     Ok(result.last_insert_rowid())
 }
 
@@ -547,6 +552,8 @@ pub struct MessageMargin {
     /// Postgres integer (int4) cast to i64 for SQLite compatibility.
     pub message_id: i64,
     pub category_name: String,
+    pub positive_similarity: f64,
+    pub negative_similarity: f64,
     /// pgvector cosine distance returns float8 (f64).
     pub margin: f64,
 }
@@ -556,6 +563,8 @@ struct MessageMarginRow {
     /// Postgres integer (int4) → i32 in sqlx.
     message_id: Option<i32>,
     message_identifier: Option<String>,
+    positive_similarity: Option<f64>,
+    negative_similarity: Option<f64>,
     /// pgvector cosine distance result is double precision (float8) → f64.
     margin: Option<f64>,
 }
@@ -592,6 +601,8 @@ pub async fn compute_embedding_margins(
         SELECT
             id        AS message_id,
             message_identifier,
+            pos_similarity AS positive_similarity,
+            neg_similarity AS negative_similarity,
             (pos_similarity - neg_similarity) AS margin
         FROM similarities
         ORDER BY (pos_similarity - neg_similarity) DESC"#,
@@ -600,9 +611,7 @@ pub async fn compute_embedding_margins(
     .bind(agent_id)
     .fetch_all(vc_db)
     .await
-    .with_context(|| {
-        format!("failed to compute embedding margins for agent {agent_id}")
-    })?;
+    .with_context(|| format!("failed to compute embedding margins for agent {agent_id}"))?;
 
     let margins = rows
         .into_iter()
@@ -610,6 +619,8 @@ pub async fn compute_embedding_margins(
             Some(MessageMargin {
                 message_id: r.message_id? as i64,
                 category_name: r.message_identifier?,
+                positive_similarity: r.positive_similarity?,
+                negative_similarity: r.negative_similarity?,
                 margin: r.margin?,
             })
         })
